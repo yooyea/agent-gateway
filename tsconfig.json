@@ -3,6 +3,7 @@
   "references": [
     {"path":"packages/protocol"},
     {"path":"packages/core"},
+    {"path":"packages/control-plane-auth"},
     {"path":"packages/credential-crypto"},
     {"path":"packages/provider-openai-agents"},
     {"path":"packages/provider-mock"},

@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.0 - 2026-09-12
+
+### Control Plane RBAC
+
+- Added `@agent-gateway/control-plane-auth`.
+- Added persisted Control Plane Principals with one-time `agcp_...` bearer tokens stored as SHA-256 hashes plus display prefixes.
+- Added Role Bindings with built-in `owner`, `admin`, `operator`, and `viewer` roles.
+- Added `global` and `tenant` scopes; tenant-scoped bindings apply only to explicitly tenant-scoped resources.
+- Restricted RBAC management to the global owner permission path so tenant-scoped identities cannot elevate themselves globally.
+- Retained `AGENT_GATEWAY_ADMIN_TOKEN` only as a bootstrap / break-glass global owner identity.
+- Added Principal enable/disable and Role Binding management endpoints.
+
+### Audit trail
+
+- Added append-only `gateway_audit_events` persistence.
+- Added Postgres triggers rejecting audit `UPDATE` and `DELETE` operations.
+- Added audit events for successful Control Plane mutations, authenticated authorization denials, and mutation errors.
+- Added audit coverage for sensitive Credential/RBAC/audit reads.
+- Added `X-Request-Id` correlation on Control Plane responses and audit events.
+- Added filtered audit query endpoint for actor/resource/tenant/outcome investigation.
+- Audit metadata intentionally excludes bearer secrets, Virtual Keys, Credential payloads, and decrypted upstream credentials.
+
+### Validation
+
+- Added pure RBAC scope/permission tests.
+- Added Postgres integration coverage for Principal authentication and append-only audit enforcement.
+- Existing Core, Credential, Postgres, Redis, Session Affinity, and idempotency suites remain part of the release gate.
+
 ## 0.3.0 - 2026-09-12
 
 ### Runtime controls

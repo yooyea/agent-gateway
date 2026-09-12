@@ -10,7 +10,7 @@ The Control Plane uses gateway-native resources under `/api/gateway/*`.
 
 ## 2. Authentication
 
-Data Plane:
+### Data Plane
 
 ```http
 Authorization: Bearer ag_xxx
@@ -18,13 +18,25 @@ Authorization: Bearer ag_xxx
 
 A Virtual Key resolves to Tenant and optional Project context. In the durable path plaintext is never stored; authentication hashes the presented secret and looks up the hash.
 
-Bootstrap Control Plane:
+### Control Plane
+
+Normal Control Plane access uses persisted Principal tokens:
 
 ```http
-Authorization: Bearer <AGENT_GATEWAY_ADMIN_TOKEN>
+Authorization: Bearer agcp_xxx
 ```
 
-The bootstrap admin token is an implementation bridge, not the final RBAC design.
+The Principal resolves to Role Bindings and permissions.
+
+The environment value `AGENT_GATEWAY_ADMIN_TOKEN` remains supported only as bootstrap / break-glass access. It is represented internally as a synthetic global owner and is not stored in Postgres.
+
+Control Plane responses include:
+
+```http
+X-Request-Id: req_...
+```
+
+A caller-supplied `X-Request-Id` is preserved up to 256 characters; otherwise the gateway creates one. Audit events persist the same request id.
 
 ## 3. Data Plane
 
@@ -121,9 +133,38 @@ Channel takes precedence over Provider. Required capabilities fail closed. Max c
 
 Routing hints participate in the Session-create idempotency fingerprint.
 
-## 5. Bootstrap Control Plane
+## 5. Control Plane permissions
 
-### Tenant / Project / Virtual Key
+The current built-in permission vocabulary is:
+
+```text
+tenants.write
+projects.write
+keys.write
+providers.read
+providers.write
+credentials.read
+credentials.write
+credentials.rewrap
+channels.read
+channels.write
+rbac.read
+rbac.manage
+audit.read
+```
+
+Built-in roles are permission bundles:
+
+- `owner` — all permissions.
+- `admin` — all operational permissions and audit access, excluding `rbac.manage`.
+- `operator` — tenant/project/key plus Provider/Credential/Channel operations.
+- `viewer` — read-only Provider/Credential/Channel/RBAC/audit metadata.
+
+Role Bindings are scoped as either `global` or `tenant`.
+
+Provider, Credential, Channel, RBAC and unfiltered Audit operations are global resources. Tenant-scoped bindings cannot authorize those operations.
+
+## 6. Tenant / Project / Virtual Key Control Plane
 
 ```text
 POST /api/gateway/admin/tenants
@@ -131,15 +172,26 @@ POST /api/gateway/admin/projects
 POST /api/gateway/admin/virtual-keys
 ```
 
+Required permissions:
+
+- Tenant create: `tenants.write` global.
+- Project create: `projects.write` global or matching tenant scope.
+- Virtual Key create: `keys.write` global or matching tenant scope.
+
 Virtual Key creation returns `key: "ag_..."` exactly once. Durable storage keeps only the key hash and display prefix.
 
-### Providers
+## 7. Provider Control Plane
 
 ```text
 GET   /api/gateway/admin/providers
 POST  /api/gateway/admin/providers
 PATCH /api/gateway/admin/providers/{provider_id}
 ```
+
+Permissions:
+
+- GET: `providers.read`
+- POST/PATCH: `providers.write`
 
 Create example:
 
@@ -156,7 +208,7 @@ Create example:
 
 Provider config is non-secret. Secret-like fields are rejected.
 
-### Credentials
+## 8. Credential Control Plane
 
 ```text
 GET   /api/gateway/admin/credentials
@@ -164,6 +216,12 @@ POST  /api/gateway/admin/credentials
 PATCH /api/gateway/admin/credentials/{credential_id}
 POST  /api/gateway/admin/credentials/{credential_id}/rewrap
 ```
+
+Permissions:
+
+- GET: `credentials.read`
+- POST/PATCH: `credentials.write`
+- rewrap: `credentials.rewrap`
 
 Create example:
 
@@ -184,13 +242,20 @@ The request payload is encrypted before durable storage. Control Plane responses
 
 `POST .../rewrap` keeps the provider secret unchanged but decrypts/re-encrypts the Credential with the current active master key.
 
-### Channels
+Credential metadata reads and mutations are audited without copying Credential payload/ciphertext into the AuditEvent.
+
+## 9. Channel Control Plane
 
 ```text
 GET   /api/gateway/admin/channels
 POST  /api/gateway/admin/channels
 PATCH /api/gateway/admin/channels/{channel_id}
 ```
+
+Permissions:
+
+- GET: `channels.read`
+- POST/PATCH: `channels.write`
 
 Create example:
 
@@ -220,9 +285,114 @@ GET /api/gateway/channels
 Authorization: Bearer ag_xxx
 ```
 
-The data-plane-authenticated view reports runtime health/circuit information without exposing Credential material.
+The Data Plane-authenticated view reports runtime health/circuit information without exposing Credential material.
 
-## 6. Credential encryption configuration
+## 10. Control Principals and Role Bindings
+
+### Principals
+
+```text
+GET   /api/gateway/admin/principals
+POST  /api/gateway/admin/principals
+PATCH /api/gateway/admin/principals/{principal_id}
+```
+
+Permissions:
+
+- GET: `rbac.read`
+- POST/PATCH: `rbac.manage`
+
+Create example:
+
+```json
+{
+  "name": "platform-ops",
+  "expires_at": "2027-01-01T00:00:00Z"
+}
+```
+
+Create response includes a one-time plaintext token:
+
+```json
+{
+  "id": "agcp_...",
+  "name": "platform-ops",
+  "tokenPrefix": "agcp_...",
+  "enabled": true,
+  "token": "agcp_..."
+}
+```
+
+The full token is never returned again.
+
+`PATCH` currently supports enable/disable:
+
+```json
+{ "enabled": false }
+```
+
+### Role Bindings
+
+```text
+GET    /api/gateway/admin/role-bindings
+POST   /api/gateway/admin/role-bindings
+DELETE /api/gateway/admin/role-bindings/{binding_id}
+```
+
+Permissions:
+
+- GET: `rbac.read`
+- POST/DELETE: `rbac.manage`
+
+Global binding example:
+
+```json
+{
+  "principal_id": "agcp_...",
+  "role": "admin",
+  "scope_type": "global"
+}
+```
+
+Tenant binding example:
+
+```json
+{
+  "principal_id": "agcp_...",
+  "role": "operator",
+  "scope_type": "tenant",
+  "scope_id": "tenant_..."
+}
+```
+
+RBAC mutation is intentionally global-only. Tenant-scoped bindings cannot call the RBAC management endpoints.
+
+## 11. Audit API
+
+```http
+GET /api/gateway/admin/audit
+```
+
+Permission: `audit.read`.
+
+Supported query parameters:
+
+```text
+limit
+actor_id
+resource_type
+resource_id
+tenant_id
+outcome=success|denied|error
+```
+
+A caller with only a tenant-scoped `audit.read` binding must supply the matching `tenant_id`. Global callers may query without a tenant filter.
+
+Audit events are append-only and include the same `X-Request-Id` returned by the Control Plane response.
+
+Successful mutations, mutation errors, authenticated authorization denials, and sensitive RBAC/Credential/audit reads generate audit evidence.
+
+## 12. Credential encryption configuration
 
 The runtime keyring is supplied outside the API:
 
@@ -235,28 +405,7 @@ Each configured key must decode from base64 to exactly 32 bytes. Multiple keys m
 
 See `docs/credentials.md` for the rotation procedure.
 
-## 7. Target Control Plane
-
-The long-term RBAC-aware resource surface remains broader:
-
-```text
-GET/POST/PATCH /api/gateway/tenants
-GET/POST/PATCH /api/gateway/projects
-GET/POST/PATCH /api/gateway/keys
-GET/POST/PATCH /api/gateway/providers
-GET/POST/PATCH /api/gateway/credentials
-GET/POST/PATCH /api/gateway/channels
-GET/POST/PATCH /api/gateway/policies
-GET            /api/gateway/sessions
-GET            /api/gateway/usage
-GET/POST/PATCH /api/gateway/pricing
-GET            /api/gateway/ledger
-GET            /api/gateway/audit
-```
-
-The current `/admin/*` bootstrap routes will be replaced or wrapped by RBAC-aware APIs rather than becoming the permanent public contract.
-
-## 8. Error model
+## 13. Error model
 
 Gateway errors use:
 
@@ -271,17 +420,17 @@ Gateway errors use:
 
 Expected HTTP classes:
 
-- `400`: invalid route/policy/capability/input, unknown Provider type, or plaintext secret config
-- `401`: invalid/missing Virtual Key or bootstrap admin token
-- `403`: policy forbids operation
-- `404`: Session/Provider/Credential/Channel not found
+- `400`: invalid route/policy/capability/input, unknown Provider type, plaintext secret config, invalid role/scope
+- `401`: invalid/missing Virtual Key or Control Plane Principal/bootstrap token
+- `403`: authenticated Control Plane Principal lacks the required permission/scope
+- `404`: Session/Provider/Credential/Channel/Principal/RoleBinding not found
 - `409`: idempotency, binding-state, duplicate, FK/ownership or state conflict
 - `429`: rate/quota/concurrency/budget admission failure
 - `502/503`: upstream Provider/Channel or required control-plane dependency unavailable
 
 Provider-native errors may be retained in protected traces/audit data, but secret-bearing upstream details must not be leaked blindly to callers.
 
-## 9. Idempotency semantics
+## 14. Idempotency semantics
 
 Session creation uses `Idempotency-Key` scoped by:
 
@@ -299,7 +448,7 @@ Outcomes:
 
 Session input/tool events continue to use the upstream-compatible body field `idempotency_key`.
 
-## 10. Identifier prefixes
+## 15. Identifier prefixes
 
 Current/new resource patterns include:
 
@@ -312,6 +461,10 @@ agprov_     Provider
 agcred_     Credential
 agch_       Channel
 agsess_     Session
+agcp_       Control Principal record / token prefix family
+agrb_       Role Binding
+agaud_      Audit Event
+req_        generated request correlation id
 ```
 
 Identifiers are opaque to clients.

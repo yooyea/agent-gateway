@@ -15,6 +15,9 @@ Tenant -> Project -> VirtualKey -> Session -> Execution
                                  -> Channel -> Provider
                                             -> Credential
 Session -> Usage -> Cost -> Reservation -> Ledger
+
+ControlPrincipal -> RoleBinding -> Permission
+ControlPrincipal -> AuditEvent
 ```
 
 `Session + Execution + Billing` is the architecture core.
@@ -41,6 +44,25 @@ Session -> Usage -> Cost -> Reservation -> Ledger
 - Budget enforcement must reserve capacity before execution instead of relying only on after-the-fact charging.
 - Never make a live session silently jump providers or channels. Migration is explicit and has lineage + declared semantic loss.
 
+## Control Plane authorization rules
+
+- `AGENT_GATEWAY_ADMIN_TOKEN` is bootstrap / break-glass access, not the steady-state operator identity model.
+- Normal Control Plane access uses persisted Control Principals with one-time bearer secrets stored hashed at rest.
+- Authorization is permission-based. HTTP handlers must not hard-code broad role-name checks when a permission can express the decision.
+- Role Bindings have explicit scope. Global resources require global authorization; tenant-scoped bindings apply only to operations carrying the matching Tenant scope.
+- RBAC management is global-only. A tenant-scoped role must never be able to elevate itself into a global role.
+- Authorization must run before the durable resource mutation.
+- Authenticated authorization denials must leave audit evidence.
+- Sensitive reads such as Credential metadata, RBAC metadata and Audit access should be auditable.
+
+## Audit rules
+
+- Audit is append-only. Application code must not expose update/delete operations for Audit Events.
+- The database must enforce immutability for audit rows in addition to application conventions.
+- Every Control Plane mutation records actor, request id, action, resource, outcome and non-secret metadata.
+- Bearer tokens, Virtual Key plaintext, Credential payloads, ciphertext, master keys and decrypted upstream credentials must never enter audit metadata.
+- Control Plane responses should expose a request id that correlates with the audit event.
+
 ## Northbound API rule
 
 Prefer an existing provider-compatible Agents API surface over inventing a gateway-specific agent protocol. Gateway-only routing/policy should use headers or the management API unless there is no compatible alternative.
@@ -62,7 +84,7 @@ Gateway management belongs under `/api/gateway/*`. It must not leak into provide
 
 Control Plane domains include:
 
-- tenants / users / RBAC
+- tenants / Control Principals / RBAC
 - projects
 - virtual keys
 - providers / channels / credentials
@@ -74,7 +96,7 @@ Control Plane domains include:
 
 ## Persistence rule
 
-- Postgres is the durable source of truth for identity, Provider/Channel/Credential configuration, SessionBindings, idempotency and future financial records.
+- Postgres is the durable source of truth for identity, RBAC, audit, Provider/Channel/Credential configuration, SessionBindings, idempotency and future financial records.
 - Redis contains only reconstructable or lease-based runtime state: cache, rate windows, concurrency leases and circuit state.
 - Master Credential encryption keys come from the runtime secret boundary (environment/KMS integration), never Postgres.
 - In-memory stores and environment-backed caller keys are development adapters only.
@@ -95,7 +117,8 @@ When the system changes materially, update the relevant normative documents in t
 4. `docs/billing.md` when usage, price, reservation or settlement semantics change.
 5. `docs/provider-plugin.md` when provider/channel contracts change.
 6. `docs/credentials.md` when Provider/Channel/Credential storage, encryption or rotation changes.
-7. `CHANGELOG.md` for every externally meaningful change.
+7. `docs/rbac-audit.md` when Control Plane identity, permissions, scopes or audit semantics change.
+8. `CHANGELOG.md` for every externally meaningful change.
 
 Code and ontology must not knowingly drift.
 

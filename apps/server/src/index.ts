@@ -1,5 +1,5 @@
 import http from "node:http";
-import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
   AgentGateway,
@@ -19,6 +19,19 @@ import {
   type SessionStore,
   type VirtualKeyRecord,
 } from "@agent-gateway/core";
+import {
+  bootstrapActor,
+  ControlPlaneAuthorizationError,
+  hashControlPlaneToken,
+  PostgresControlPlaneSecurity,
+  requirePermission,
+  secureTokenEqual,
+  tokenPrefix as controlTokenPrefix,
+  type ControlPlaneActor,
+  type ControlPlanePermission,
+  type ControlPlaneRole,
+  type RoleScopeType,
+} from "@agent-gateway/control-plane-auth";
 import { CredentialKeyring, credentialContext } from "@agent-gateway/credential-crypto";
 import { RedisRuntimeControls } from "@agent-gateway/runtime-redis";
 import {
@@ -96,30 +109,16 @@ function envPositiveInteger(name: string, fallback: number) {
   return value;
 }
 
-function safeTokenEqual(actual: string | undefined, expected: string) {
-  if (!actual) return false;
-  const a = Buffer.from(actual);
-  const b = Buffer.from(expected);
-  return a.length === b.length && timingSafeEqual(a, b);
-}
-
-function adminToken(req: http.IncomingMessage) {
-  return req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
-}
-
-function requireAdmin(req: http.IncomingMessage) {
-  const expected = process.env.AGENT_GATEWAY_ADMIN_TOKEN ??
-    (process.env.NODE_ENV === "production" ? undefined : "admin_dev_local");
-  if (!expected) throw new Error("Control plane admin token is not configured");
-  if (!safeTokenEqual(adminToken(req), expected)) throw new Error("Invalid admin token");
-}
-
 function prefixedId(prefix: string) {
   return `${prefix}_${randomUUID().replaceAll("-", "")}`;
 }
 
 function createVirtualKeySecret() {
   return `ag_${randomBytes(32).toString("base64url")}`;
+}
+
+function createControlPlaneSecret() {
+  return `agcp_${randomBytes(32).toString("base64url")}`;
 }
 
 function recordObject(value: unknown, name: string) {
@@ -157,6 +156,7 @@ async function createPersistence(): Promise<{
   idempotency: IdempotencyStore;
   authenticator: GatewayAuthenticator;
   database?: PostgresGatewayStore;
+  controlSecurity?: PostgresControlPlaneSecurity;
 }> {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
@@ -167,10 +167,15 @@ async function createPersistence(): Promise<{
       authenticator: new StaticVirtualKeyAuthenticator(loadStaticKeys()),
     };
   }
+
   const store = new PostgresGatewayStore(databaseUrl);
+  const controlSecurity = new PostgresControlPlaneSecurity(databaseUrl);
   const autoMigrate = process.env.AGENT_GATEWAY_AUTO_MIGRATE === "true" ||
     (process.env.AGENT_GATEWAY_AUTO_MIGRATE !== "false" && process.env.NODE_ENV !== "production");
-  if (autoMigrate) await store.migrate();
+  if (autoMigrate) {
+    await store.migrate();
+    await controlSecurity.migrate();
+  }
   if (process.env.AGENT_GATEWAY_DEV_BOOTSTRAP === "true") {
     if (process.env.NODE_ENV === "production") throw new Error("AGENT_GATEWAY_DEV_BOOTSTRAP must not be enabled in production");
     await store.seedDevelopmentIdentity({
@@ -185,6 +190,7 @@ async function createPersistence(): Promise<{
     idempotency: store,
     authenticator: new StoreBackedVirtualKeyAuthenticator(store),
     database: store,
+    controlSecurity,
   };
 }
 
@@ -326,13 +332,14 @@ function json(res: http.ServerResponse, status: number, data: unknown, headers: 
 
 function errorStatus(error: unknown) {
   if (error instanceof GatewayAdmissionError) return 429;
+  if (error instanceof ControlPlaneAuthorizationError) return 403;
   const message = error instanceof Error ? error.message : String(error);
-  if (/Missing bearer token|Invalid API key|Invalid admin token/.test(message)) return 401;
-  if (/admin token is not configured/.test(message)) return 503;
-  if (/Session not found|Provider not found|Credential not found|Channel not found/.test(message)) return 404;
+  if (/Missing bearer token|Invalid API key|Invalid control plane token/.test(message)) return 401;
+  if (/Control plane security requires DATABASE_URL/.test(message)) return 503;
+  if (/Session not found|Provider not found|Credential not found|Channel not found|Control principal not found|Role binding not found/.test(message)) return 404;
   if (/Session is not bound|Idempotency request is still in progress|Idempotency key was already used/.test(message)) return 409;
   if (/Channel circuit is open|No healthy channel/.test(message)) return 503;
-  if (/Unknown channel|Unknown provider type|does not satisfy|must be|required|Sensitive field/.test(message)) return 400;
+  if (/Unknown channel|Unknown provider type|does not satisfy|must be|required|Sensitive field|Invalid role|Invalid scope/.test(message)) return 400;
   const code = (error as { code?: string } | null)?.code;
   if (code === "23505" || code === "23503" || code === "23514") return 409;
   return 500;
@@ -429,80 +436,282 @@ async function executeIdempotent<T>(input: {
   return { ...result, replay: false };
 }
 
+function controlBearer(req: http.IncomingMessage) {
+  return req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+}
+
+function requestId(req: http.IncomingMessage) {
+  const header = req.headers["x-request-id"];
+  return typeof header === "string" && header.trim() ? header.trim().slice(0, 256) : `req_${randomUUID().replaceAll("-", "")}`;
+}
+
+async function authenticateControlPlane(req: http.IncomingMessage): Promise<ControlPlaneActor> {
+  const token = controlBearer(req);
+  if (!token) throw new Error("Invalid control plane token");
+  const bootstrapToken = process.env.AGENT_GATEWAY_ADMIN_TOKEN ??
+    (process.env.NODE_ENV === "production" ? undefined : "admin_dev_local");
+  if (bootstrapToken && secureTokenEqual(token, bootstrapToken)) return bootstrapActor();
+  const security = persistence.controlSecurity;
+  if (!security) throw new Error("Control plane security requires DATABASE_URL");
+  const actor = await security.authenticateToken(token);
+  if (!actor) throw new Error("Invalid control plane token");
+  return actor;
+}
+
+async function appendAudit(input: {
+  actor: ControlPlaneActor;
+  requestId: string;
+  action: string;
+  resourceType: string;
+  resourceId?: string;
+  tenantId?: string;
+  outcome: "success" | "denied" | "error";
+  metadata?: Record<string, unknown>;
+}) {
+  if (!persistence.controlSecurity) return;
+  await persistence.controlSecurity.appendAudit({
+    id: prefixedId("agaud"),
+    actor: input.actor,
+    requestId: input.requestId,
+    action: input.action,
+    resourceType: input.resourceType,
+    resourceId: input.resourceId,
+    tenantId: input.tenantId,
+    outcome: input.outcome,
+    metadata: input.metadata,
+  });
+}
+
+async function authorizeControl(input: {
+  actor: ControlPlaneActor;
+  requestId: string;
+  permission: ControlPlanePermission;
+  action: string;
+  resourceType: string;
+  resourceId?: string;
+  tenantId?: string;
+}) {
+  try {
+    requirePermission(input.actor, input.permission, input.tenantId);
+  } catch (error) {
+    await appendAudit({
+      actor: input.actor,
+      requestId: input.requestId,
+      action: input.action,
+      resourceType: input.resourceType,
+      resourceId: input.resourceId,
+      tenantId: input.tenantId,
+      outcome: "denied",
+      metadata: { permission: input.permission },
+    }).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function controlMutation<T>(input: {
+  actor: ControlPlaneActor;
+  requestId: string;
+  permission: ControlPlanePermission;
+  action: string;
+  resourceType: string;
+  resourceId?: string;
+  tenantId?: string;
+  metadata?: Record<string, unknown>;
+  run: () => Promise<T>;
+  resultResourceId?: (result: T) => string | undefined;
+}) {
+  await authorizeControl(input);
+  try {
+    const result = await input.run();
+    await appendAudit({
+      actor: input.actor,
+      requestId: input.requestId,
+      action: input.action,
+      resourceType: input.resourceType,
+      resourceId: input.resultResourceId?.(result) ?? input.resourceId,
+      tenantId: input.tenantId,
+      outcome: "success",
+      metadata: input.metadata,
+    });
+    return result;
+  } catch (error) {
+    await appendAudit({
+      actor: input.actor,
+      requestId: input.requestId,
+      action: input.action,
+      resourceType: input.resourceType,
+      resourceId: input.resourceId,
+      tenantId: input.tenantId,
+      outcome: "error",
+      metadata: { ...input.metadata, error: error instanceof Error ? error.message : String(error) },
+    }).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function controlRead(input: {
+  actor: ControlPlaneActor;
+  requestId: string;
+  permission: ControlPlanePermission;
+  action: string;
+  resourceType: string;
+  tenantId?: string;
+  auditSuccess?: boolean;
+  run: () => Promise<unknown>;
+}) {
+  await authorizeControl(input);
+  const result = await input.run();
+  if (input.auditSuccess) {
+    await appendAudit({
+      actor: input.actor,
+      requestId: input.requestId,
+      action: input.action,
+      resourceType: input.resourceType,
+      tenantId: input.tenantId,
+      outcome: "success",
+    });
+  }
+  return result;
+}
+
+function parseRole(value: unknown): ControlPlaneRole {
+  if (value === "owner" || value === "admin" || value === "operator" || value === "viewer") return value;
+  throw new Error("Invalid role");
+}
+
+function parseScope(value: unknown): RoleScopeType {
+  if (value === "global" || value === "tenant") return value;
+  throw new Error("Invalid scope_type");
+}
+
 async function handleControlPlane(req: http.IncomingMessage, res: http.ServerResponse, path: string) {
   if (!path.startsWith("/api/gateway/admin/")) return false;
-  requireAdmin(req);
   const store = persistence.database;
-  if (!store) throw new Error("Persistent control plane requires DATABASE_URL");
+  const security = persistence.controlSecurity;
+  if (!store || !security) throw new Error("Control plane security requires DATABASE_URL");
+  const actor = await authenticateControlPlane(req);
+  const rid = requestId(req);
+  const responseHeaders = { "x-request-id": rid };
 
   if (req.method === "POST" && path === "/api/gateway/admin/tenants") {
     const body = await readJson(req) as { name?: string };
     if (!body.name?.trim()) throw new Error("Tenant name is required");
-    json(res, 201, await store.createTenant({ id: prefixedId("tenant"), name: body.name.trim() }));
-    return true;
+    const result = await controlMutation({
+      actor, requestId: rid, permission: "tenants.write", action: "tenant.create", resourceType: "tenant",
+      run: () => store.createTenant({ id: prefixedId("tenant"), name: body.name!.trim() }),
+      resultResourceId: (value: any) => value.id,
+    });
+    json(res, 201, result, responseHeaders); return true;
   }
+
   if (req.method === "POST" && path === "/api/gateway/admin/projects") {
     const body = await readJson(req) as { tenant_id?: string; name?: string };
     if (!body.tenant_id?.trim() || !body.name?.trim()) throw new Error("tenant_id and project name are required");
-    json(res, 201, await store.createProject({ id: prefixedId("project"), tenantId: body.tenant_id.trim(), name: body.name.trim() }));
-    return true;
+    const tenantId = body.tenant_id.trim();
+    const result = await controlMutation({
+      actor, requestId: rid, permission: "projects.write", action: "project.create", resourceType: "project", tenantId,
+      run: () => store.createProject({ id: prefixedId("project"), tenantId, name: body.name!.trim() }),
+      resultResourceId: (value: any) => value.id,
+    });
+    json(res, 201, result, responseHeaders); return true;
   }
+
   if (req.method === "POST" && path === "/api/gateway/admin/virtual-keys") {
     const body = await readJson(req) as { tenant_id?: string; project_id?: string; name?: string; expires_at?: string };
     if (!body.tenant_id?.trim() || !body.name?.trim()) throw new Error("tenant_id and key name are required");
     if (body.expires_at && !Number.isFinite(new Date(body.expires_at).getTime())) throw new Error("expires_at must be a valid date-time");
+    const tenantId = body.tenant_id.trim();
     const secret = createVirtualKeySecret();
-    const record = await store.createVirtualKey({
-      id: prefixedId("vk"), tenantId: body.tenant_id.trim(), projectId: body.project_id?.trim() || undefined,
-      name: body.name.trim(), keyHash: hashVirtualKey(secret), keyPrefix: secret.slice(0, 10), expiresAt: body.expires_at,
+    const result = await controlMutation({
+      actor, requestId: rid, permission: "keys.write", action: "virtual_key.create", resourceType: "virtual_key", tenantId,
+      run: async () => {
+        const record = await store.createVirtualKey({
+          id: prefixedId("vk"), tenantId, projectId: body.project_id?.trim() || undefined,
+          name: body.name!.trim(), keyHash: hashVirtualKey(secret), keyPrefix: secret.slice(0, 10), expiresAt: body.expires_at,
+        });
+        return { ...record, key: secret };
+      },
+      resultResourceId: (value: any) => value.id,
     });
-    json(res, 201, { ...record, key: secret });
-    return true;
+    json(res, 201, result, responseHeaders); return true;
   }
 
   if (req.method === "GET" && path === "/api/gateway/admin/providers") {
-    json(res, 200, await store.listProviders()); return true;
+    const result = await controlRead({
+      actor, requestId: rid, permission: "providers.read", action: "provider.list", resourceType: "provider",
+      run: () => store.listProviders(),
+    });
+    json(res, 200, result, responseHeaders); return true;
   }
+
   if (req.method === "POST" && path === "/api/gateway/admin/providers") {
     const body = await readJson(req) as { type?: string; display_name?: string; enabled?: boolean; config?: unknown };
     const type = body.type?.trim();
     if (!type || !moduleCatalog[type]) throw new Error(`Unknown provider type: ${type ?? ""}`);
     const config = body.config === undefined ? {} : recordObject(body.config, "config");
     assertNonSecretConfig(config);
-    const provider = await store.createProvider({
-      id: prefixedId("agprov"), type, displayName: body.display_name?.trim() || type,
-      enabled: body.enabled ?? true, config,
+    const result = await controlMutation({
+      actor, requestId: rid, permission: "providers.write", action: "provider.create", resourceType: "provider",
+      run: async () => {
+        const provider = await store.createProvider({
+          id: prefixedId("agprov"), type, displayName: body.display_name?.trim() || type,
+          enabled: body.enabled ?? true, config,
+        });
+        await reloadGateway();
+        return provider;
+      },
+      resultResourceId: (value: any) => value.id,
     });
-    await reloadGateway();
-    json(res, 201, provider); return true;
+    json(res, 201, result, responseHeaders); return true;
   }
+
   let match = path.match(/^\/api\/gateway\/admin\/providers\/([^/]+)$/);
   if (req.method === "PATCH" && match) {
+    const id = decodeURIComponent(match[1]);
     const body = await readJson(req) as { display_name?: string; enabled?: boolean; config?: unknown };
     const config = body.config === undefined ? undefined : recordObject(body.config, "config");
     if (config) assertNonSecretConfig(config);
-    const provider = await store.updateProvider(decodeURIComponent(match[1]), {
-      displayName: body.display_name?.trim() || undefined, enabled: body.enabled, config,
+    const result = await controlMutation({
+      actor, requestId: rid, permission: "providers.write", action: "provider.update", resourceType: "provider", resourceId: id,
+      run: async () => {
+        const provider = await store.updateProvider(id, {
+          displayName: body.display_name?.trim() || undefined, enabled: body.enabled, config,
+        });
+        await reloadGateway();
+        return provider;
+      },
     });
-    await reloadGateway();
-    json(res, 200, provider); return true;
+    json(res, 200, result, responseHeaders); return true;
   }
 
   if (req.method === "GET" && path === "/api/gateway/admin/credentials") {
-    json(res, 200, await store.listCredentials()); return true;
+    const result = await controlRead({
+      actor, requestId: rid, permission: "credentials.read", action: "credential.list", resourceType: "credential", auditSuccess: true,
+      run: () => store.listCredentials(),
+    });
+    json(res, 200, result, responseHeaders); return true;
   }
+
   if (req.method === "POST" && path === "/api/gateway/admin/credentials") {
     const body = await readJson(req) as { provider_id?: string; name?: string; kind?: string; payload?: unknown };
     if (!body.provider_id?.trim() || !body.name?.trim()) throw new Error("provider_id and credential name are required");
     const payload = recordObject(body.payload, "payload");
     const id = prefixedId("agcred");
-    const encrypted = credentialKeyring.encrypt(payload, credentialContext(id, body.provider_id.trim()));
-    const credential = await store.createCredential({
-      id, providerId: body.provider_id.trim(), name: body.name.trim(), kind: body.kind?.trim() || "generic",
-      encryptedPayload: encrypted.envelope, encryptionKeyId: encrypted.keyId, algorithm: encrypted.algorithm,
+    const providerId = body.provider_id.trim();
+    const result = await controlMutation({
+      actor, requestId: rid, permission: "credentials.write", action: "credential.create", resourceType: "credential", resourceId: id,
+      metadata: { provider_id: providerId, kind: body.kind?.trim() || "generic" },
+      run: async () => {
+        const encrypted = credentialKeyring.encrypt(payload, credentialContext(id, providerId));
+        return store.createCredential({
+          id, providerId, name: body.name!.trim(), kind: body.kind?.trim() || "generic",
+          encryptedPayload: encrypted.envelope, encryptionKeyId: encrypted.keyId, algorithm: encrypted.algorithm,
+        });
+      },
     });
-    json(res, 201, credential); return true;
+    json(res, 201, result, responseHeaders); return true;
   }
+
   match = path.match(/^\/api\/gateway\/admin\/credentials\/([^/]+)$/);
   if (req.method === "PATCH" && match) {
     const id = decodeURIComponent(match[1]);
@@ -510,42 +719,70 @@ async function handleControlPlane(req: http.IncomingMessage, res: http.ServerRes
     if (!existing) throw new Error(`Credential not found: ${id}`);
     const body = await readJson(req) as { payload?: unknown };
     const payload = recordObject(body.payload, "payload");
-    const encrypted = credentialKeyring.encrypt(payload, credentialContext(id, existing.providerId));
-    const credential = await store.updateCredentialEnvelope(id, {
-      encryptedPayload: encrypted.envelope, encryptionKeyId: encrypted.keyId, algorithm: encrypted.algorithm,
+    const result = await controlMutation({
+      actor, requestId: rid, permission: "credentials.write", action: "credential.secret.replace", resourceType: "credential", resourceId: id,
+      metadata: { provider_id: existing.providerId },
+      run: async () => {
+        const encrypted = credentialKeyring.encrypt(payload, credentialContext(id, existing.providerId));
+        const credential = await store.updateCredentialEnvelope(id, {
+          encryptedPayload: encrypted.envelope, encryptionKeyId: encrypted.keyId, algorithm: encrypted.algorithm,
+        });
+        await reloadGateway();
+        return credential;
+      },
     });
-    await reloadGateway();
-    json(res, 200, credential); return true;
+    json(res, 200, result, responseHeaders); return true;
   }
+
   match = path.match(/^\/api\/gateway\/admin\/credentials\/([^/]+)\/rewrap$/);
   if (req.method === "POST" && match) {
     const id = decodeURIComponent(match[1]);
     const existing = await store.getEncryptedCredential(id);
     if (!existing) throw new Error(`Credential not found: ${id}`);
-    const encrypted = credentialKeyring.rewrap(existing.encryptedPayload, credentialContext(id, existing.providerId));
-    json(res, 200, await store.updateCredentialEnvelope(id, {
-      encryptedPayload: encrypted.envelope, encryptionKeyId: encrypted.keyId, algorithm: encrypted.algorithm,
-    }));
-    return true;
+    const result = await controlMutation({
+      actor, requestId: rid, permission: "credentials.rewrap", action: "credential.rewrap", resourceType: "credential", resourceId: id,
+      metadata: { provider_id: existing.providerId, from_key_id: existing.encryptionKeyId, to_key_id: credentialKeyring.activeKeyId },
+      run: async () => {
+        const encrypted = credentialKeyring.rewrap(existing.encryptedPayload, credentialContext(id, existing.providerId));
+        return store.updateCredentialEnvelope(id, {
+          encryptedPayload: encrypted.envelope, encryptionKeyId: encrypted.keyId, algorithm: encrypted.algorithm,
+        });
+      },
+    });
+    json(res, 200, result, responseHeaders); return true;
   }
 
   if (req.method === "GET" && path === "/api/gateway/admin/channels") {
-    json(res, 200, await store.listChannels()); return true;
+    const result = await controlRead({
+      actor, requestId: rid, permission: "channels.read", action: "channel.list", resourceType: "channel",
+      run: () => store.listChannels(),
+    });
+    json(res, 200, result, responseHeaders); return true;
   }
+
   if (req.method === "POST" && path === "/api/gateway/admin/channels") {
     const body = await readJson(req) as { provider_id?: string; credential_id?: string; name?: string; enabled?: boolean; priority?: number; weight?: number; config?: unknown };
     if (!body.provider_id?.trim() || !body.name?.trim()) throw new Error("provider_id and channel name are required");
     const config = body.config === undefined ? {} : recordObject(body.config, "config");
     assertNonSecretConfig(config);
-    const channel = await store.createChannel({
-      id: prefixedId("agch"), providerId: body.provider_id.trim(), credentialId: body.credential_id?.trim() || undefined,
-      name: body.name.trim(), enabled: body.enabled ?? true, priority: body.priority, weight: body.weight, config,
+    const result = await controlMutation({
+      actor, requestId: rid, permission: "channels.write", action: "channel.create", resourceType: "channel",
+      run: async () => {
+        const channel = await store.createChannel({
+          id: prefixedId("agch"), providerId: body.provider_id!.trim(), credentialId: body.credential_id?.trim() || undefined,
+          name: body.name!.trim(), enabled: body.enabled ?? true, priority: body.priority, weight: body.weight, config,
+        });
+        await reloadGateway();
+        return channel;
+      },
+      resultResourceId: (value: any) => value.id,
     });
-    await reloadGateway();
-    json(res, 201, channel); return true;
+    json(res, 201, result, responseHeaders); return true;
   }
+
   match = path.match(/^\/api\/gateway\/admin\/channels\/([^/]+)$/);
   if (req.method === "PATCH" && match) {
+    const id = decodeURIComponent(match[1]);
     const body = await readJson(req) as { credential_id?: string | null; name?: string; enabled?: boolean; priority?: number; weight?: number; config?: unknown };
     const config = body.config === undefined ? undefined : recordObject(body.config, "config");
     if (config) assertNonSecretConfig(config);
@@ -553,12 +790,120 @@ async function handleControlPlane(req: http.IncomingMessage, res: http.ServerRes
       name: body.name?.trim() || undefined, enabled: body.enabled, priority: body.priority, weight: body.weight, config,
     };
     if (Object.prototype.hasOwnProperty.call(body, "credential_id")) patch.credentialId = body.credential_id?.trim() || null;
-    const channel = await store.updateChannel(decodeURIComponent(match[1]), patch);
-    await reloadGateway();
-    json(res, 200, channel); return true;
+    const result = await controlMutation({
+      actor, requestId: rid, permission: "channels.write", action: "channel.update", resourceType: "channel", resourceId: id,
+      run: async () => {
+        const channel = await store.updateChannel(id, patch);
+        await reloadGateway();
+        return channel;
+      },
+    });
+    json(res, 200, result, responseHeaders); return true;
   }
 
-  json(res, 404, { error: { type: "not_found", message: "Control plane route not found" } });
+  if (req.method === "GET" && path === "/api/gateway/admin/principals") {
+    const result = await controlRead({
+      actor, requestId: rid, permission: "rbac.read", action: "principal.list", resourceType: "control_principal", auditSuccess: true,
+      run: () => security.listPrincipals(),
+    });
+    json(res, 200, result, responseHeaders); return true;
+  }
+
+  if (req.method === "POST" && path === "/api/gateway/admin/principals") {
+    const body = await readJson(req) as { name?: string; expires_at?: string };
+    if (!body.name?.trim()) throw new Error("Principal name is required");
+    if (body.expires_at && !Number.isFinite(new Date(body.expires_at).getTime())) throw new Error("expires_at must be a valid date-time");
+    const secret = createControlPlaneSecret();
+    const id = prefixedId("agcp");
+    const result = await controlMutation({
+      actor, requestId: rid, permission: "rbac.manage", action: "principal.create", resourceType: "control_principal", resourceId: id,
+      run: async () => {
+        const principal = await security.createPrincipal({
+          id,
+          name: body.name!.trim(),
+          tokenHash: hashControlPlaneToken(secret),
+          tokenPrefix: controlTokenPrefix(secret),
+          expiresAt: body.expires_at,
+        });
+        return { ...principal, token: secret };
+      },
+    });
+    json(res, 201, result, responseHeaders); return true;
+  }
+
+  match = path.match(/^\/api\/gateway\/admin\/principals\/([^/]+)$/);
+  if (req.method === "PATCH" && match) {
+    const id = decodeURIComponent(match[1]);
+    const body = await readJson(req) as { enabled?: boolean };
+    if (typeof body.enabled !== "boolean") throw new Error("enabled is required");
+    const result = await controlMutation({
+      actor, requestId: rid, permission: "rbac.manage", action: "principal.update", resourceType: "control_principal", resourceId: id,
+      run: () => security.setPrincipalEnabled(id, body.enabled!),
+    });
+    json(res, 200, result, responseHeaders); return true;
+  }
+
+  if (req.method === "GET" && path === "/api/gateway/admin/role-bindings") {
+    const result = await controlRead({
+      actor, requestId: rid, permission: "rbac.read", action: "role_binding.list", resourceType: "role_binding", auditSuccess: true,
+      run: () => security.listRoleBindings(),
+    });
+    json(res, 200, result, responseHeaders); return true;
+  }
+
+  if (req.method === "POST" && path === "/api/gateway/admin/role-bindings") {
+    const body = await readJson(req) as { principal_id?: string; role?: unknown; scope_type?: unknown; scope_id?: string };
+    if (!body.principal_id?.trim()) throw new Error("principal_id is required");
+    const role = parseRole(body.role);
+    const scopeType = parseScope(body.scope_type);
+    const scopeId = body.scope_id?.trim() || undefined;
+    if (scopeType === "tenant" && !scopeId) throw new Error("scope_id is required for tenant scope");
+    if (scopeType === "global" && scopeId) throw new Error("scope_id must be omitted for global scope");
+    const id = prefixedId("agrb");
+    const result = await controlMutation({
+      actor, requestId: rid, permission: "rbac.manage", action: "role_binding.create", resourceType: "role_binding", resourceId: id,
+      metadata: { principal_id: body.principal_id.trim(), role, scope_type: scopeType, scope_id: scopeId },
+      run: () => security.createRoleBinding({
+        id,
+        principalId: body.principal_id!.trim(),
+        role,
+        scopeType,
+        scopeId,
+      }),
+    });
+    json(res, 201, result, responseHeaders); return true;
+  }
+
+  match = path.match(/^\/api\/gateway\/admin\/role-bindings\/([^/]+)$/);
+  if (req.method === "DELETE" && match) {
+    const id = decodeURIComponent(match[1]);
+    const result = await controlMutation({
+      actor, requestId: rid, permission: "rbac.manage", action: "role_binding.delete", resourceType: "role_binding", resourceId: id,
+      run: () => security.deleteRoleBinding(id),
+    });
+    json(res, 200, result, responseHeaders); return true;
+  }
+
+  if (req.method === "GET" && path === "/api/gateway/admin/audit") {
+    const url = new URL(req.url ?? path, `http://${req.headers.host ?? "localhost"}`);
+    const tenantId = url.searchParams.get("tenant_id")?.trim() || undefined;
+    const outcome = url.searchParams.get("outcome") as "success" | "denied" | "error" | null;
+    if (outcome && !["success", "denied", "error"].includes(outcome)) throw new Error("Invalid audit outcome");
+    const result = await controlRead({
+      actor, requestId: rid, permission: "audit.read", action: "audit.list", resourceType: "audit_event", tenantId, auditSuccess: true,
+      run: () => security.listAudit({
+        limit: Number(url.searchParams.get("limit") ?? 100),
+        actorId: url.searchParams.get("actor_id")?.trim() || undefined,
+        resourceType: url.searchParams.get("resource_type")?.trim() || undefined,
+        resourceId: url.searchParams.get("resource_id")?.trim() || undefined,
+        tenantId,
+        outcome: outcome || undefined,
+      }),
+    });
+    json(res, 200, result, responseHeaders); return true;
+  }
+
+  json(res, 404, { error: { type: "not_found", message: "Control plane route not found" } }, responseHeaders);
   return true;
 }
 

@@ -24,6 +24,33 @@ A namespace inside a Tenant. Sessions and Virtual Keys may be scoped to a Projec
 
 A caller credential issued by the gateway. A VirtualKey resolves to exactly one Tenant and may resolve to one Project.
 
+### ControlPrincipal
+
+A durable Control Plane operator or service identity.
+
+A ControlPrincipal authenticates with a one-time `agcp_*` bearer secret. The plaintext secret is returned only at creation time; the durable record stores only a SHA-256 hash and display prefix.
+
+The environment bootstrap administrator is represented at runtime as a synthetic ControlPrincipal-like actor but is not persisted as a normal database Principal.
+
+### RoleBinding
+
+Relates a ControlPrincipal to a built-in Role within an explicit scope.
+
+A RoleBinding has:
+
+- one ControlPrincipal
+- one Role (`owner`, `admin`, `operator`, `viewer`)
+- one scope type (`global` or `tenant`)
+- an optional Tenant scope id when the scope type is `tenant`
+
+Role names are policy bundles; authorization decisions are expressed in Permissions.
+
+### Permission
+
+A stable Control Plane capability such as `channels.write`, `credentials.rewrap`, `rbac.manage`, or `audit.read`.
+
+Global resources require global permission. Tenant-scoped bindings may satisfy a permission only when the operation carries the matching Tenant scope.
+
 ## 2. Runtime supply domain
 
 ### Provider
@@ -152,7 +179,7 @@ Immutable financial record. Historical LedgerEntries are never recomputed when a
 
 Compares later provider truth with provisional measurements and emits adjustment LedgerEntries rather than mutating history.
 
-## 6. Observability domain
+## 6. Observability and governance domain
 
 ### Trace
 
@@ -160,7 +187,22 @@ Correlates requests, executions, provider calls, tools and usage.
 
 ### AuditEvent
 
-Records security/administrative mutations such as key creation, Channel/Credential changes, price changes or manual balance adjustments.
+An append-only security/administrative fact describing a Control Plane action.
+
+An AuditEvent records:
+
+- actor identity
+- request id
+- action
+- resource type and optional resource id
+- optional Tenant scope
+- outcome (`success`, `denied`, `error`)
+- non-secret metadata
+- creation time
+
+AuditEvent is not a general application log. It is durable governance evidence and may not contain bearer tokens, Virtual Key secrets, Credential payloads, ciphertext, master encryption keys, or decrypted provider secrets.
+
+Authenticated permission denials are AuditEvents even though no resource mutation occurred.
 
 ## 7. Critical relations
 
@@ -169,9 +211,16 @@ Tenant 1 --- N Project
 Tenant 1 --- N VirtualKey
 Tenant 1 --- N Session
 Project 1 --- N Session
+
+ControlPrincipal 1 --- N RoleBinding
+RoleBinding N --- 1 Role
+RoleBinding N --- 1 Scope
+ControlPrincipal 1 --- N AuditEvent
+
 Provider 1 --- N Channel
 Provider 1 --- N Credential
 Channel N --- 0..1 Credential (same Provider only)
+
 Session 1 --- 1 SessionBinding
 Session 1 --- N Execution
 Session 1 --- N UsageEvent
@@ -198,3 +247,11 @@ UsageEvent N --- 1..N LedgerEntry (through settlement/adjustment)
 13. Price changes affect future settlement according to effective-time semantics; they do not rewrite past invoices.
 14. Budget enforcement may reject new work even when the last settled charge is below the budget because outstanding Reservations count against available capacity.
 15. Cross-provider or cross-Channel session movement is represented as explicit migration/lineage, never hidden rerouting.
+16. A persisted ControlPrincipal secret is represented only by a hash/prefix; plaintext is returned once and is not recoverable from Postgres.
+17. Authorization decisions are permission-based and run before the governed resource mutation.
+18. Tenant-scoped RoleBindings cannot authorize global-only resources or RBAC management.
+19. RBAC management requires a global permission path; a tenant-scoped identity cannot elevate itself globally.
+20. Authenticated Control Plane authorization denials produce AuditEvents.
+21. AuditEvent is append-only and cannot be updated or deleted through the application or ordinary database row mutation.
+22. Secret material must never be copied into AuditEvent metadata.
+23. A Control Plane request id correlates the API operation with its AuditEvent.
