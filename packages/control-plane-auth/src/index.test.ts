@@ -112,6 +112,24 @@ test("Postgres RBAC, control idempotency and atomic audit transaction", { skip: 
     state: "conflict",
   });
 
+  // An expired one-shot key must be cleanable even when that exact key is never retried.
+  const abandonedKey = `abandoned-${suffix}`;
+  await external.query(
+    `INSERT INTO gateway_control_idempotency(
+      actor_id,scope,idempotency_key,request_hash,state,expires_at
+    ) VALUES ($1,'probe.create',$2,$3,'pending',now() - interval '1 minute')`,
+    [principalId, abandonedKey, "c".repeat(64)],
+  );
+  assert.equal(
+    (await external.query("SELECT 1 FROM gateway_control_idempotency WHERE idempotency_key=$1", [abandonedKey])).rowCount,
+    1,
+  );
+  assert((await security.purgeExpiredControlIdempotency()) >= 1);
+  assert.equal(
+    (await external.query("SELECT 1 FROM gateway_control_idempotency WHERE idempotency_key=$1", [abandonedKey])).rowCount,
+    0,
+  );
+
   const rollbackProbe = `rollback_${suffix}`;
   const rollbackAudit = `agaud_rollback_${suffix}`;
   await assert.rejects(
@@ -151,6 +169,7 @@ test("Postgres RBAC, control idempotency and atomic audit transaction", { skip: 
   assert.equal((await security.listAudit({ resourceId: commitProbe })).length, 1);
 
   await external.query("DELETE FROM gateway_control_tx_probe WHERE id=$1", [commitProbe]);
+  await security.pool.query("DELETE FROM gateway_control_idempotency WHERE actor_id=$1", [principalId]);
   await security.pool.query("DELETE FROM gateway_role_bindings WHERE principal_id=$1", [principalId]);
   await security.pool.query("DELETE FROM gateway_control_principals WHERE id=$1", [principalId]);
   await external.end();
