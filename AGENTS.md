@@ -54,14 +54,19 @@ ControlPrincipal -> AuditEvent
 - Authorization must run before the durable resource mutation.
 - Authenticated authorization denials must leave audit evidence.
 - Sensitive reads such as Credential metadata, RBAC metadata and Audit access should be auditable.
+- Control Plane idempotency is scoped by actor + operation + key. Reusing a key with a changed request must fail closed.
+- Idempotent replay state that contains one-time secrets must be encrypted at rest; plaintext bearer/Virtual Key secrets must never be stored in replay tables.
 
 ## Audit rules
 
 - Audit is append-only. Application code must not expose update/delete operations for Audit Events.
 - The database must enforce immutability for audit rows in addition to application conventions.
 - Every Control Plane mutation records actor, request id, action, resource, outcome and non-secret metadata.
+- A successful Control Plane resource mutation, its success AuditEvent, and its idempotency completion must commit in the same Postgres transaction.
+- A failed mutation must roll back the resource and success AuditEvent together; an error AuditEvent may be appended only after rollback.
+- Runtime side effects derived from Control Plane state (for example registry reload) happen after durable commit and must not turn an already-committed mutation into a false retry signal.
 - Bearer tokens, Virtual Key plaintext, Credential payloads, ciphertext, master keys and decrypted upstream credentials must never enter audit metadata.
-- Control Plane responses should expose a request id that correlates with the audit event.
+- Every Control Plane response, including failures, must expose the same request id used by its audit evidence.
 
 ## Northbound API rule
 
