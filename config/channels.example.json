@@ -1,0 +1,22 @@
+{
+  "defaultProvider": "openai-agents",
+  "channels": [
+    {
+      "id": "openai-primary",
+      "module": "@agent-gateway/provider-openai-agents",
+      "enabled": true,
+      "priority": 100,
+      "weight": 100,
+      "config": {
+        "baseUrl": "https://api.openai.com/v1"
+      }
+    },
+    {
+      "id": "mock-fallback",
+      "module": "@agent-gateway/provider-mock",
+      "enabled": true,
+      "priority": 1000,
+      "weight": 1
+    }
+  ]
+}

@@ -1,6 +1,31 @@
 services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: agent_gateway
+      POSTGRES_USER: agent_gateway
+      POSTGRES_PASSWORD: agent_gateway_local
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_gateway -d agent_gateway"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - agent-gateway-postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+
   agent-gateway:
     build: .
     ports: ["8787:8787"]
     env_file: [.env]
+    environment:
+      DATABASE_URL: postgres://agent_gateway:agent_gateway_local@postgres:5432/agent_gateway
+      AGENT_GATEWAY_AUTO_MIGRATE: "true"
+      AGENT_GATEWAY_DEV_BOOTSTRAP: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  agent-gateway-postgres:

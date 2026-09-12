@@ -1,0 +1,13 @@
+{
+  "name": "@agent-gateway/storage-postgres",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": { "build": "tsc -b" },
+  "dependencies": {
+    "@agent-gateway/core": "0.2.0",
+    "pg": "^8.16.3"
+  }
+}
