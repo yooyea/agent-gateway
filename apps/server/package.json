@@ -1,11 +1,13 @@
 {
   "name": "@agent-gateway/server",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
   "scripts": { "build": "tsc -b" },
   "dependencies": {
+    "@agent-gateway/billing-postgres": "0.5.0",
+    "@agent-gateway/billing-runtime": "0.5.0",
     "@agent-gateway/control-plane-auth": "0.4.1",
     "@agent-gateway/core": "0.2.0",
     "@agent-gateway/credential-crypto": "0.3.0",
