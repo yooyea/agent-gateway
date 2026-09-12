@@ -1,5 +1,6 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { Pool, type PoolConfig } from "pg";
+import { Pool, type PoolClient, type PoolConfig } from "pg";
 
 export type ControlPlanePermission =
   | "tenants.write"
@@ -110,6 +111,20 @@ export interface AuditEventRecord {
   metadata: Record<string, unknown>;
   createdAt: string;
 }
+
+export interface ControlIdempotencyClaimInput {
+  actorId: string;
+  scope: string;
+  key: string;
+  requestHash: string;
+  expiresAt: string;
+}
+
+export type ControlIdempotencyClaimResult =
+  | { state: "claimed" }
+  | { state: "replay"; responseStatus: number; responseEnvelope: string }
+  | { state: "conflict" }
+  | { state: "in_progress" };
 
 export class ControlPlaneAuthorizationError extends Error {
   constructor(
@@ -229,6 +244,23 @@ CREATE INDEX IF NOT EXISTS gateway_audit_events_tenant_idx
   ON gateway_audit_events(tenant_id, created_at DESC)
   WHERE tenant_id IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS gateway_control_idempotency (
+  actor_id text NOT NULL,
+  scope text NOT NULL,
+  idempotency_key text NOT NULL,
+  request_hash char(64) NOT NULL,
+  state text NOT NULL CHECK (state IN ('pending', 'completed')),
+  response_status integer,
+  response_envelope text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  expires_at timestamptz NOT NULL,
+  PRIMARY KEY (actor_id, scope, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS gateway_control_idempotency_expiry_idx
+  ON gateway_control_idempotency(expires_at);
+
 CREATE OR REPLACE FUNCTION gateway_reject_audit_mutation()
 RETURNS trigger AS $$
 BEGIN
@@ -291,11 +323,54 @@ function auditFromRow(row: Record<string, any>): AuditEventRecord {
   };
 }
 
+interface TransactionState {
+  client: PoolClient;
+}
+
 export class PostgresControlPlaneSecurity {
   readonly pool: Pool;
+  private readonly transaction = new AsyncLocalStorage<TransactionState>();
+  private readonly wrappedPools = new WeakSet<object>();
 
   constructor(config: string | PoolConfig) {
     this.pool = new Pool(typeof config === "string" ? { connectionString: config } : config);
+    this.attachTransactionalPool(this.pool);
+  }
+
+  /**
+   * Makes another pg Pool participate in this security store's transaction context.
+   * This is used by the durable gateway store so a resource mutation and its AuditEvent
+   * commit or roll back together even though the repositories are separate modules.
+   */
+  attachTransactionalPool(pool: Pool) {
+    if (this.wrappedPools.has(pool)) return;
+    this.wrappedPools.add(pool);
+    const originalQuery = pool.query.bind(pool) as (...args: any[]) => any;
+    const transaction = this.transaction;
+    (pool as any).query = (...args: any[]) => {
+      const state = transaction.getStore();
+      return state ? (state.client.query as any)(...args) : originalQuery(...args);
+    };
+  }
+
+  inTransaction() {
+    return Boolean(this.transaction.getStore());
+  }
+
+  async withTransaction<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.inTransaction()) return fn();
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await this.transaction.run({ client }, fn);
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async close() {
@@ -461,6 +536,96 @@ export class PostgresControlPlaneSecurity {
       values,
     );
     return result.rows.map(auditFromRow);
+  }
+
+  async claimControlIdempotency(input: ControlIdempotencyClaimInput): Promise<ControlIdempotencyClaimResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `DELETE FROM gateway_control_idempotency
+         WHERE actor_id=$1 AND scope=$2 AND idempotency_key=$3 AND expires_at <= now()`,
+        [input.actorId, input.scope, input.key],
+      );
+      const inserted = await client.query(
+        `INSERT INTO gateway_control_idempotency(
+           actor_id, scope, idempotency_key, request_hash, state, expires_at
+         ) VALUES ($1,$2,$3,$4,'pending',$5)
+         ON CONFLICT DO NOTHING
+         RETURNING request_hash`,
+        [input.actorId, input.scope, input.key, input.requestHash, input.expiresAt],
+      );
+      if (inserted.rowCount === 1) {
+        await client.query("COMMIT");
+        return { state: "claimed" };
+      }
+      const existing = await client.query(
+        `SELECT request_hash, state, response_status, response_envelope
+         FROM gateway_control_idempotency
+         WHERE actor_id=$1 AND scope=$2 AND idempotency_key=$3
+         FOR UPDATE`,
+        [input.actorId, input.scope, input.key],
+      );
+      const row = existing.rows[0];
+      await client.query("COMMIT");
+      if (!row) return { state: "in_progress" };
+      if (String(row.request_hash) !== input.requestHash) return { state: "conflict" };
+      if (row.state === "completed" && row.response_envelope) {
+        return {
+          state: "replay",
+          responseStatus: Number(row.response_status ?? 200),
+          responseEnvelope: String(row.response_envelope),
+        };
+      }
+      return { state: "in_progress" };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async completeControlIdempotency(input: {
+    actorId: string;
+    scope: string;
+    key: string;
+    requestHash: string;
+    responseStatus: number;
+    responseEnvelope: string;
+    expiresAt: string;
+  }) {
+    const result = await this.pool.query(
+      `UPDATE gateway_control_idempotency
+       SET state='completed', response_status=$5, response_envelope=$6,
+           expires_at=$7, updated_at=now()
+       WHERE actor_id=$1 AND scope=$2 AND idempotency_key=$3
+         AND request_hash=$4 AND state='pending'`,
+      [
+        input.actorId,
+        input.scope,
+        input.key,
+        input.requestHash,
+        input.responseStatus,
+        input.responseEnvelope,
+        input.expiresAt,
+      ],
+    );
+    if (result.rowCount !== 1) throw new Error("Control plane idempotency claim not found");
+  }
+
+  async releaseControlIdempotency(input: {
+    actorId: string;
+    scope: string;
+    key: string;
+    requestHash: string;
+  }) {
+    await this.pool.query(
+      `DELETE FROM gateway_control_idempotency
+       WHERE actor_id=$1 AND scope=$2 AND idempotency_key=$3
+         AND request_hash=$4 AND state='pending'`,
+      [input.actorId, input.scope, input.key, input.requestHash],
+    );
   }
 }
 
