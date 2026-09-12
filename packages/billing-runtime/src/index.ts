@@ -111,12 +111,16 @@ export class BillingSessionStore implements SessionStore {
       if (reservation) {
         await this.billing.releaseReservation(reservation.id).catch(() => undefined);
       }
-      await this.base.update({
-        ...record,
-        state: "failed",
-        lastError: errorMessage(error),
-        updatedAt: new Date().toISOString(),
-      }).catch(() => undefined);
+      try {
+        await this.base.update({
+          ...record,
+          state: "failed",
+          lastError: errorMessage(error),
+          updatedAt: new Date().toISOString(),
+        });
+      } catch {
+        // Preserve the original admission error. The durable store remains authoritative.
+      }
       throw error;
     }
   }
