@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.5.0 - 2026-09-13
+
+### Financial foundation
+
+- Added `@agent-gateway/billing-postgres` with durable BillingAccount, effective-dated PriceRule, immutable UsageEvent, UsageSettlement, UsageCounter, Reservation and immutable LedgerEntry resources.
+- Money is stored as integer USD micros / exact database numerics rather than JavaScript floating-point ledger values.
+- Provider cumulative usage is converted into Session + metric deltas; repeated snapshots do not double-charge.
+- Added provider measurement watermarks so stale/out-of-order cumulative snapshots cannot move billing state backward.
+- Provider corrections create negative adjustment UsageEvents and refund/adjustment LedgerEntries rather than rewriting history.
+- PriceRule snapshots are persisted on LedgerEntries so future pricing changes cannot rewrite historical charges.
+- Reservation admission serializes against the Tenant BillingAccount and prevents concurrent Sessions from spending the same available capacity.
+- Only the unconsumed Reservation amount remains held, avoiding double-counting customer spend already represented in the Ledger.
+
+### Data Plane billing runtime
+
+- Added `@agent-gateway/billing-runtime` as the lifecycle boundary between Agent Sessions and billing persistence.
+- A Tenant with a BillingAccount now requires a positive hard Session `max_cost_usd` before new billed Session creation.
+- Billed Session capacity is reserved and attached to the durable `agsess_*` record before the upstream Provider is contacted.
+- Failed provider Session creation releases the active Reservation best-effort; Reservation expiry remains the safety net.
+- Added strict preflight usage refresh, settlement and SessionBudget admission before `POST /events` and event streaming.
+- Added best-effort post-provider usage reconciliation so a successful upstream mutation is not misreported as failed solely because local accounting refresh failed.
+- Added HTTP 402 billing-capacity / budget-required / billing-disabled responses and HTTP 429 hard SessionBudget responses with gateway limit headers.
+- Added Project-level Session isolation for Project-scoped Virtual Keys while retaining Tenant-wide access for Tenant-level keys.
+- Failed Data Plane execution now releases a pending Postgres idempotency claim when no successful upstream side effect occurred.
+
+### Validation
+
+- Added real Postgres tests for concurrent Reservation admission, cumulative usage deduplication, first-observation concurrency, stale snapshot rejection, provider corrections, price snapshots and immutable Usage/Ledger history.
+- Added billing-runtime lifecycle tests for pre-provider Reservation, failed-binding release, billed-budget requirement, unbilled compatibility and GatewaySession usage normalization.
+- Existing Postgres 17 + Redis 7 CI remains the release gate.
+
+### Known boundary
+
+- Provider SSE streams are currently opaque bytes, so v0.5 enforces budget before stream admission and reconciles cumulative provider usage after stream completion. Precise mid-stream cutoff requires incremental provider usage observability.
+
 ## 0.4.1 - 2026-09-12
 
 ### Control Plane correctness hardening
