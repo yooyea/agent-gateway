@@ -12,6 +12,16 @@ Therefore:
 provider usage != immutable customer ledger
 ```
 
+The implemented financial path separates four concerns:
+
+```text
+Provider cumulative usage
+        -> immutable UsageEvent delta
+        -> mutable UsageSettlement state
+        -> immutable LedgerEntry
+        -> Reservation consumption / SessionBudget guard
+```
+
 ## 2. Monetary layers
 
 The platform keeps at least two monetary views:
@@ -21,9 +31,23 @@ Upstream Cost: what the gateway owes providers
 Customer Charge: what the tenant owes the gateway
 ```
 
-Each is calculated from versioned PriceRules and usage facts.
+Each is calculated from effective-dated PriceRules and usage facts.
 
-## 3. UsageEvent
+Stored money uses integer USD micros. JavaScript floating-point values are never the durable source of truth for money.
+
+## 3. BillingAccount
+
+A Tenant becomes billed when it has a `BillingAccount`.
+
+Current Data Plane behavior is intentionally explicit:
+
+- Tenant without BillingAccount: legacy/unbilled execution remains allowed.
+- Tenant with enabled BillingAccount: new Sessions require a positive hard `max_cost_usd` budget.
+- Tenant with disabled BillingAccount: new billed work is rejected.
+
+A later plan/policy layer may supply tenant defaults. Until then, a billed caller declares the hard budget through the Data Plane budget header.
+
+## 4. UsageEvent
 
 Usage is normalized into append-only events such as:
 
@@ -39,60 +63,105 @@ tool.call
 provider.other
 ```
 
-A UsageEvent should include:
+A UsageEvent includes the durable attribution needed for settlement:
 
-- tenant/project/session/execution
+- tenant/project/session
 - provider/channel
-- unit type
-- quantity
+- metric and delta quantity
 - measured_at
 - provider source/reference
-- provisional/final state
-- raw evidence reference
+- provisional/final/adjustment finality
+- non-secret metadata
 
-## 4. PriceRule
+`gateway_usage_events` is database-enforced append-only. Provider corrections create adjustment events; they never rewrite an older usage fact.
+
+## 5. Cumulative provider usage and counters
+
+Provider Session usage may be cumulative and may be observed repeatedly.
+
+The gateway keeps one durable counter per Session + metric and computes:
+
+```text
+new cumulative observation - previously observed cumulative value = UsageEvent delta
+```
+
+The counter row is created before it is locked, so even two concurrent first observations serialize correctly.
+
+Each counter also stores a provider measurement watermark. An observation older than the current watermark is ignored rather than rolling the cumulative value backward.
+
+Equal cumulative observations may advance the watermark but do not create a duplicate UsageEvent or charge.
+
+A lower newer cumulative value is treated as a provider correction and creates a negative adjustment delta.
+
+## 6. UsageSettlement
+
+Usage facts and processing state are intentionally separate.
+
+`UsageEvent` is immutable evidence. `UsageSettlement` records whether that fact currently has a usable PriceRule:
+
+```text
+no_price
+settled -> price_rule_id
+```
+
+This allows a historical `no_price` usage event to be settled later without mutating the original evidence.
+
+## 7. PriceRule
 
 A PriceRule is effective-dated.
 
-Example dimensions:
+Supported dimensions include:
 
+- tenant override or global rule
 - provider
 - model
-- service tier
-- unit type
-- tenant/plan
+- metric
+- unit scale
+- upstream unit price
+- customer unit price
 - effective start/end
 
-It yields upstream unit cost and/or customer unit price.
+The rule selected at the UsageEvent measurement time is snapshotted onto the resulting LedgerEntry. Later price changes cannot rewrite historical charges.
 
-The PriceRule snapshot used during settlement must be referenced by the resulting ledger entry.
-
-## 5. Reservation
+## 8. Reservation
 
 Long-running Agent executions can overspend if the platform only charges after completion.
 
-Before admitting work, the gateway should reserve capacity:
+For a billed Tenant, Session creation follows:
 
 ```text
-available_balance = balance - active_reservations
+persist SessionBinding(state=creating)
+        |
+        v
+resolve BillingAccount
+        |
+        v
+reserve max_cost_usd capacity
+        |
+        v
+attach Reservation to agsess_...
+        |
+        v
+only then call the upstream Provider
 ```
 
-Example:
+If reservation/admission fails, the upstream Provider is never contacted.
+
+If Provider Session creation later fails, the active Reservation is released best-effort. A hold also has an expiry so a release failure cannot reserve capacity forever.
+
+Available capacity accounts for customer Ledger balance and only the **unconsumed** part of active Reservations:
 
 ```text
-wallet balance       $10.00
-new session budget    $2.00
-reserved               2.00
-available              8.00
+available = credit_limit + ledger_balance - active_unconsumed_reservations
 ```
 
-If the session settles at `$0.74`, release `$1.26` and post the final charge.
+Consumed spend is already represented by the Ledger, so it must not also remain fully held by the Reservation.
 
-Reservation also prevents many concurrent sessions from each believing they can spend the same remaining dollar.
+Reservation admission locks the Tenant BillingAccount row so concurrent Sessions cannot spend the same remaining capacity.
 
-## 6. SessionBudget
+## 9. SessionBudget
 
-Supported policy dimensions should include:
+The policy shape supports:
 
 ```json
 {
@@ -103,57 +172,88 @@ Supported policy dimensions should include:
 }
 ```
 
-Budget enforcement stages:
+The first hard-enforced financial dimension is `max_cost_usd`.
 
-1. admission check
-2. reservation
-3. continuous estimated-cost update
-4. warning threshold policy
-5. hard stop / deny additional work
-6. settlement
-7. release unused reservation
+For billed Tenants the Data Plane receives it through:
 
-## 7. Settlement
+```http
+X-Agent-Gateway-Max-Cost-USD: 2.00
+```
+
+The value must be positive and may contain at most six decimal places.
+
+Before additional Agent work (`POST /events` and event streaming), the gateway:
+
+1. resolves the durable Session and Project context,
+2. retrieves the current provider Session usage,
+3. strictly normalizes and settles the latest cumulative usage,
+4. evaluates the remaining Reservation/SessionBudget,
+5. contacts the Provider only if admission still passes.
+
+An exhausted budget fails before additional provider work.
+
+Status-only `GET /agents/sessions/{id}` is not treated as new Agent work; it may retrieve the Session and best-effort observe usage.
+
+## 10. Runtime settlement behavior
+
+After Session creation, retrieve, event submission, and stream completion, provider Session usage can be observed and settled.
+
+There are two accounting modes on the hot path:
+
+### Fail-closed preflight
+
+Before expensive follow-up work, usage refresh + settlement is strict. If the gateway cannot establish current billable state, it does not knowingly admit more work.
+
+### Best-effort post-provider reconciliation
+
+After an upstream mutation has already succeeded, a local usage-refresh failure must not turn that success into a client-visible failure that encourages the caller to submit the same mutation again.
+
+The gateway logs the reconciliation failure. The next expensive operation performs the strict preflight again and catches up from cumulative provider usage.
+
+## 11. Streaming limitation
+
+The current provider abstraction returns opaque SSE bytes. Therefore v0.5 performs hard budget admission immediately before opening a stream and reconciles provider cumulative usage when the stream ends.
+
+A very long stream can consume beyond the last preflight estimate before the gateway sees a final cumulative Session snapshot.
+
+Future incremental streaming metering should parse provider-native usage events or expose a provider usage callback so the gateway can stop an in-flight stream near its hard budget. Until that exists, the Reservation remains the maximum authorized financial hold and post-stream reconciliation records the actual observed usage.
+
+## 12. Settlement and Ledger
 
 A normal flow:
 
 ```text
-UsageEvent (provisional)
+UsageEvent
        |
        v
-Price lookup at effective time
+Price lookup at measured_at
        |
        v
-Provisional Cost/Charge
+UsageSettlement
        |
-       v
-Reservation consumption
+       +--------> upstream LedgerEntry
        |
-       v
-LedgerEntry
+       +--------> customer LedgerEntry
+                         |
+                         v
+              Reservation consumed_micros
 ```
 
-LedgerEntry is immutable.
+`LedgerEntry` is immutable and idempotent.
 
-## 8. Reconciliation
+Customer positive usage creates a debit. A negative provider correction creates a credit/refund. Upstream cost uses its own ledger book.
 
-Provider truth may arrive later or may differ from an intermediate session usage snapshot.
+## 13. Reconciliation
 
-Reconciliation compares:
+Provider truth may arrive later or may differ from an intermediate Session usage snapshot.
 
-```text
-what we provisionally measured
-vs
-what provider records eventually report
-```
+Reconciliation compares cumulative provider truth with the durable UsageCounter. The delta becomes a new UsageEvent and corresponding LedgerEntries.
 
-Difference is represented by adjustment UsageEvents/LedgerEntries.
+Never mutate old UsageEvents or LedgerEntries to make history disappear.
 
-Never mutate the old LedgerEntry to make history disappear.
+## 14. Ledger event categories
 
-## 9. Ledger
-
-Recommended double-entry-inspired event categories:
+Current/future categories include:
 
 - reservation.hold
 - reservation.release
@@ -165,9 +265,9 @@ Recommended double-entry-inspired event categories:
 - payment
 - manual.adjustment
 
-Even if the first implementation is a simpler balance ledger, entries must be immutable and idempotent.
+The current Reservation is represented as durable mutable hold state rather than a separate hold/release ledger pair. Financial charge/refund entries themselves remain immutable.
 
-## 10. Pricing strategies
+## 15. Pricing strategies
 
 The SaaS may support:
 
@@ -181,15 +281,20 @@ The SaaS may support:
 
 The routing engine may later consider both upstream cost and sell margin, but financial policy must never silently violate tenant provider/capability constraints.
 
-## 11. Data consistency
+## 16. Data consistency invariants
 
-Financial writes require:
+Financial code must preserve these invariants:
 
-- database transaction
-- idempotency key
-- unique provider usage reference where possible
-- integer minor units or exact decimal arithmetic
-- currency field
-- immutable timestamps and price snapshots
-
-Floating-point arithmetic must not be the source of truth for stored money.
+- Postgres is the financial source of truth.
+- Reservation admission serializes against the Tenant BillingAccount.
+- A billed Session reserves capacity before upstream Session creation.
+- The same consumed dollar is never counted in both Ledger spend and the full Reservation hold.
+- UsageEvent and LedgerEntry are append-only at the database layer.
+- Usage settlement state is stored separately from UsageEvent evidence.
+- cumulative usage counters serialize concurrent first observations.
+- stale provider observations do not move a counter watermark backward.
+- provider corrections are explicit negative deltas, not history rewrites.
+- every LedgerEntry snapshots the price rule used to produce it.
+- money is stored in integer micros / exact database numeric arithmetic.
+- successful upstream mutations are not reported as failed solely because best-effort post-operation accounting refresh failed.
+- the next expensive operation must fail closed if current usage/budget state cannot be established.
