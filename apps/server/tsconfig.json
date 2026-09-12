@@ -5,7 +5,8 @@
     {"path":"../../packages/core"},
     {"path":"../../packages/provider-openai-agents"},
     {"path":"../../packages/provider-mock"},
-    {"path":"../../packages/storage-postgres"}
+    {"path":"../../packages/storage-postgres"},
+    {"path":"../../packages/runtime-redis"}
   ],
   "include":["src/**/*.ts"]
 }

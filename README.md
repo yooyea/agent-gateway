@@ -18,6 +18,7 @@ Any client / SaaS / IDE / CI
 | Auth / Tenant / Project     |
 | Session Router + Affinity   |
 | Channel Pool / Failover     |
+| Rate / Concurrency / Circuit|
 | Quota / Budget / Policy     |
 | Usage / Billing / Ledger    |
 | Audit / Trace / Metrics     |
@@ -69,6 +70,7 @@ apps/server                       Data plane + bootstrap control plane
 packages/protocol                 Provider plugin contract and shared types
 packages/core                     Routing, session affinity, auth + idempotency contracts
 packages/storage-postgres         Durable SaaS identity/session/idempotency store
+packages/runtime-redis            Rate limit, concurrency, hot cache and circuit state
 packages/provider-openai-agents   OpenAI Agents API adapter
 packages/provider-mock            Local/test provider
 packages/sdk                      Optional TypeScript client
@@ -78,12 +80,13 @@ docs/ontology.md                  Domain ontology and invariants
 docs/api-spec.md                  Northbound and management API contract
 docs/billing.md                   Metering, reservation and settlement model
 docs/persistence.md               Postgres schema and durability semantics
+docs/runtime-controls.md          Redis runtime-state semantics
 docs/provider-plugin.md           Provider/channel plugin contract
 ```
 
 ## Current implementation
 
-`v0.2` now contains the first durable SaaS foundation:
+The current foundation contains:
 
 - OpenAI Agents API-shaped data plane: `/agents/sessions`
 - Postgres-backed Tenant / Project / Virtual Key persistence
@@ -92,22 +95,26 @@ docs/provider-plugin.md           Provider/channel plugin contract
 - Session binding lifecycle: `creating -> bound | failed`
 - strict session affinity to the originally selected Channel
 - persisted `Idempotency-Key` handling for session creation with request fingerprints and replay
+- Redis fixed-window rate limiting per Virtual Key
+- Redis concurrency leases with heartbeat renewal and crash-safe TTL expiry
+- Redis read-through/write-through hot Session cache with Postgres remaining authoritative
+- Redis Channel circuit-breaker state for **new-session routing only**
 - provider/channel separation and capability-aware routing
 - OpenAI Agents API adapter
 - event submission and event streaming
 - provider plugin architecture
-- in-memory persistence remains available for lightweight local development when `DATABASE_URL` is absent
+- real Postgres + Redis integration tests in CI
 
-Billing ledger, Redis operational state, hard budget enforcement and RBAC remain subsequent implementation layers.
+Billing ledger, persistent Channel configuration, encrypted upstream credentials, hard budget enforcement and RBAC remain subsequent implementation layers.
 
-## Quick start with Postgres
+## Quick start with Postgres + Redis
 
 ```bash
 cp .env.example .env
 docker compose up --build
 ```
 
-The compose stack starts Postgres, runs schema bootstrap in development, and creates:
+The compose stack starts Postgres and Redis, runs schema bootstrap in development, and creates:
 
 ```text
 Virtual Key:  ag_dev_local
@@ -136,11 +143,15 @@ curl -X POST http://localhost:8787/agents/sessions \
   }'
 ```
 
+Successful data-plane responses expose the current rate-limit envelope. A rejected request returns `429`, `Retry-After`, and `x-agent-gateway-limit-type` (`rate` or `concurrency`).
+
 Retrying the same request with the same `Idempotency-Key` returns the original gateway session and adds:
 
 ```text
 x-agent-gateway-idempotent-replay: true
 ```
+
+An idempotent replay still counts against request rate limits but does **not** consume an upstream concurrency lease because it does not call the provider.
 
 Force a provider or channel without changing the Agents API request body:
 
@@ -156,6 +167,8 @@ List channels:
 curl http://localhost:8787/api/gateway/channels \
   -H 'authorization: Bearer ag_dev_local'
 ```
+
+The channel response includes `circuitOpen`. An open circuit excludes that Channel from **new Session** selection. Existing bound Sessions remain pinned to their original Channel and are never transparently migrated.
 
 ## Bootstrap Control Plane
 
@@ -177,19 +190,31 @@ POST /api/gateway/admin/virtual-keys
 
 A generated Virtual Key secret is returned once. Only its hash and display prefix are persisted.
 
-## Local process without Postgres
+## Local process without infrastructure
 
-For a minimal development process:
+For a lightweight development process you may unset both durable and runtime services:
 
 ```bash
 cp .env.example .env
 unset DATABASE_URL
+unset REDIS_URL
 npm install
 npm run build
 npm start
 ```
 
-This uses the in-memory Session/Idempotency stores and `AGENT_GATEWAY_KEYS`.
+This uses in-memory Session/Idempotency stores and `AGENT_GATEWAY_KEYS`; Redis-backed admission, cache and circuit state are disabled. Production requires both `DATABASE_URL` and `REDIS_URL`.
+
+## Design rule: durable truth vs operational state
+
+Postgres is authoritative for tenant identity, Virtual Keys, Session Bindings and idempotency. Redis contains only reconstructable or lease-based operational state:
+
+```text
+Postgres: durable truth
+Redis:    hot cache / rate window / concurrency lease / circuit state
+```
+
+Redis loss must never erase a Session Binding or financial truth. Redis cache failures fall back to the durable SessionStore. Rate/concurrency Redis failures fail the data-plane request rather than silently allowing unbounded upstream spend.
 
 ## Design rule: compatibility outside, governance inside
 
@@ -201,15 +226,13 @@ The control plane is separate under `/api/gateway/*` and owns tenants, projects,
 
 The implementation order is intentionally infrastructure-first:
 
-1. Redis-backed concurrency/rate limiting and hot session cache
-2. persistent provider/channel configuration and encrypted credential storage
-3. RBAC + operator audit for the Control Plane
-4. usage meter + immutable billing ledger
-5. session budget reservation and hard-stop policy
-6. provider cost reconciliation
-7. channel health, circuit breaking and failover policy
-8. full admin/dashboard APIs
-9. additional provider adapters
-10. explicit cross-provider migration instead of pretending sessions are stateless
+1. persistent Provider/Channel configuration and encrypted credential storage
+2. RBAC + operator audit for the Control Plane
+3. usage meter + immutable billing ledger
+4. session budget reservation and hard-stop policy
+5. provider cost reconciliation and richer health scoring
+6. full admin/dashboard APIs
+7. additional provider adapters
+8. explicit cross-provider migration instead of pretending sessions are stateless
 
 See the documents in `docs/` for the normative design.

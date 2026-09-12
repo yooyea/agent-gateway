@@ -83,6 +83,16 @@ export class InMemorySessionStore implements SessionStore {
   }
 }
 
+export interface ChannelRuntimeState {
+  /**
+   * Used only when assigning new sessions. Existing bound sessions never migrate
+   * merely because a circuit is open.
+   */
+  isChannelAvailable(channelId: string): Promise<boolean>;
+  recordChannelSuccess(channelId: string): Promise<void>;
+  recordChannelFailure(channelId: string): Promise<void>;
+}
+
 export interface VirtualKeyIdentity {
   id: string;
   tenantId: string;
@@ -319,7 +329,34 @@ export class AgentGateway {
     private readonly registry: ProviderRegistry,
     private readonly sessions: SessionStore = new InMemorySessionStore(),
     private readonly defaultProvider?: string,
+    private readonly runtime?: ChannelRuntimeState,
   ) {}
+
+  private async channelAvailable(channelId: string) {
+    if (!this.runtime) return true;
+    try {
+      return await this.runtime.isChannelAvailable(channelId);
+    } catch {
+      // Circuit state is operational acceleration, not durable routing truth.
+      return true;
+    }
+  }
+
+  private async recordChannelSuccess(channelId: string) {
+    try {
+      await this.runtime?.recordChannelSuccess(channelId);
+    } catch {
+      // Provider success must not be hidden by runtime-state telemetry failure.
+    }
+  }
+
+  private async recordChannelFailure(channelId: string) {
+    try {
+      await this.runtime?.recordChannelFailure(channelId);
+    } catch {
+      // The original provider error remains authoritative.
+    }
+  }
 
   async channels() {
     return Promise.all(
@@ -330,6 +367,7 @@ export class AgentGateway {
         enabled: channel.enabled,
         priority: channel.priority,
         weight: channel.weight,
+        circuitOpen: !(await this.channelAvailable(channel.id)),
         capabilities: await channel.provider.capabilities(),
         health: await channel.provider.health(),
       })),
@@ -340,6 +378,7 @@ export class AgentGateway {
     if (hints.channel) {
       const explicit = this.registry.get(hints.channel);
       if (!explicit.enabled) throw new Error(`Channel disabled: ${hints.channel}`);
+      if (!(await this.channelAvailable(explicit.id))) throw new Error(`Channel circuit is open: ${hints.channel}`);
       if (!supports(await explicit.provider.capabilities(), hints.requiredCapabilities)) {
         throw new Error(`Channel ${hints.channel} does not satisfy required capabilities`);
       }
@@ -353,6 +392,7 @@ export class AgentGateway {
 
     const eligible: ProviderChannel[] = [];
     for (const channel of candidates) {
+      if (!(await this.channelAvailable(channel.id))) continue;
       if (!(await channel.provider.health()).ok) continue;
       if (!supports(await channel.provider.capabilities(), hints.requiredCapabilities)) continue;
       eligible.push(channel);
@@ -391,12 +431,14 @@ export class AgentGateway {
 
     try {
       const providerSession = await channel.provider.createSession(request);
+      await this.recordChannelSuccess(channel.id);
       record.providerSessionId = providerSession.providerSessionId;
       record.state = "bound";
       record.updatedAt = new Date().toISOString();
       await this.sessions.update(record);
       return gatewaySession(record, providerSession);
     } catch (error) {
+      await this.recordChannelFailure(channel.id);
       record.state = "failed";
       record.lastError = error instanceof Error ? error.message : String(error);
       record.updatedAt = new Date().toISOString();
@@ -417,17 +459,29 @@ export class AgentGateway {
 
   async getSession(id: string, context: GatewayRequestContext) {
     const { record, channel, providerSessionId } = await this.resolve(id, context);
-    const providerSession = await channel.provider.getSession(providerSessionId);
-    record.updatedAt = new Date().toISOString();
-    await this.sessions.update(record);
-    return gatewaySession(record, providerSession);
+    try {
+      const providerSession = await channel.provider.getSession(providerSessionId);
+      await this.recordChannelSuccess(channel.id);
+      record.updatedAt = new Date().toISOString();
+      await this.sessions.update(record);
+      return gatewaySession(record, providerSession);
+    } catch (error) {
+      await this.recordChannelFailure(channel.id);
+      throw error;
+    }
   }
 
   async sendEvents(id: string, request: SessionEventBatch, context: GatewayRequestContext) {
     const { record, channel, providerSessionId } = await this.resolve(id, context);
-    await channel.provider.sendEvents(providerSessionId, request);
-    record.updatedAt = new Date().toISOString();
-    await this.sessions.update(record);
+    try {
+      await channel.provider.sendEvents(providerSessionId, request);
+      await this.recordChannelSuccess(channel.id);
+      record.updatedAt = new Date().toISOString();
+      await this.sessions.update(record);
+    } catch (error) {
+      await this.recordChannelFailure(channel.id);
+      throw error;
+    }
   }
 
   async streamEvents(id: string, context: GatewayRequestContext) {
@@ -435,6 +489,33 @@ export class AgentGateway {
     if (!channel.provider.streamEvents) {
       throw new Error(`Provider ${channel.provider.type} does not support event streaming`);
     }
-    return channel.provider.streamEvents(providerSessionId);
+
+    let stream: AsyncIterable<Uint8Array>;
+    try {
+      stream = await channel.provider.streamEvents(providerSessionId);
+    } catch (error) {
+      await this.recordChannelFailure(channel.id);
+      throw error;
+    }
+
+    const runtime = this.runtime;
+    const channelId = channel.id;
+    return (async function* () {
+      try {
+        for await (const chunk of stream) yield chunk;
+        try {
+          await runtime?.recordChannelSuccess(channelId);
+        } catch {
+          // A completed provider stream remains successful if runtime state is unavailable.
+        }
+      } catch (error) {
+        try {
+          await runtime?.recordChannelFailure(channelId);
+        } catch {
+          // Preserve the provider stream error.
+        }
+        throw error;
+      }
+    })();
   }
 }

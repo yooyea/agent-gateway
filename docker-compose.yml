@@ -14,18 +14,33 @@ services:
       - agent-gateway-postgres:/var/lib/postgresql/data
     restart: unless-stopped
 
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - agent-gateway-redis:/data
+    restart: unless-stopped
+
   agent-gateway:
     build: .
     ports: ["8787:8787"]
     env_file: [.env]
     environment:
       DATABASE_URL: postgres://agent_gateway:agent_gateway_local@postgres:5432/agent_gateway
+      REDIS_URL: redis://redis:6379
       AGENT_GATEWAY_AUTO_MIGRATE: "true"
       AGENT_GATEWAY_DEV_BOOTSTRAP: "true"
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
   agent-gateway-postgres:
+  agent-gateway-redis:

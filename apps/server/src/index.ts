@@ -19,6 +19,7 @@ import {
   type SessionStore,
   type VirtualKeyRecord,
 } from "@agent-gateway/core";
+import { RedisRuntimeControls } from "@agent-gateway/runtime-redis";
 import { PostgresGatewayStore } from "@agent-gateway/storage-postgres";
 import type { AgentCapability, CreateSessionRequest, SessionEventBatch } from "@agent-gateway/protocol";
 
@@ -39,6 +40,16 @@ interface ControlPlaneStore {
     keyPrefix: string;
     expiresAt?: string;
   }): Promise<unknown>;
+}
+
+class GatewayAdmissionError extends Error {
+  constructor(
+    message: string,
+    readonly headers: Record<string, string> = {},
+  ) {
+    super(message);
+    this.name = "GatewayAdmissionError";
+  }
 }
 
 async function loadConfig(): Promise<GatewayConfig> {
@@ -80,6 +91,12 @@ function loadStaticKeys(): VirtualKeyRecord[] {
       enabled: true,
     },
   ];
+}
+
+function envPositiveInteger(name: string, fallback: number) {
+  const value = Number(process.env[name] ?? fallback);
+  if (!Number.isInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
+  return value;
 }
 
 function safeTokenEqual(actual: string | undefined, expected: string) {
@@ -151,13 +168,36 @@ async function createPersistence(): Promise<{
   };
 }
 
+async function createRuntimeControls() {
+  const redisUrl = process.env.REDIS_URL;
+  if (!redisUrl) {
+    if (process.env.NODE_ENV === "production") throw new Error("REDIS_URL is required in production");
+    return undefined;
+  }
+  return RedisRuntimeControls.connect(redisUrl, {
+    keyPrefix: process.env.AGENT_GATEWAY_REDIS_PREFIX ?? "agent-gateway",
+    circuitFailureThreshold: envPositiveInteger("AGENT_GATEWAY_CIRCUIT_FAILURE_THRESHOLD", 3),
+    circuitFailureWindowSeconds: envPositiveInteger("AGENT_GATEWAY_CIRCUIT_FAILURE_WINDOW_SECONDS", 60),
+    circuitOpenSeconds: envPositiveInteger("AGENT_GATEWAY_CIRCUIT_OPEN_SECONDS", 30),
+  });
+}
+
 const cfg = await loadConfig();
 const registry = await loadProviderPlugins(cfg.channels, new ProviderRegistry());
 const persistence = await createPersistence();
-const gateway = new AgentGateway(registry, persistence.sessions, cfg.defaultProvider);
+const runtimeControls = await createRuntimeControls();
+const sessionCacheTtlSeconds = envPositiveInteger("AGENT_GATEWAY_SESSION_CACHE_TTL_SECONDS", 300);
+const sessions = runtimeControls
+  ? runtimeControls.createCachedSessionStore(persistence.sessions, sessionCacheTtlSeconds)
+  : persistence.sessions;
+const gateway = new AgentGateway(registry, sessions, cfg.defaultProvider, runtimeControls);
 const port = Number(process.env.PORT ?? 8787);
-const idempotencyPendingTtlSeconds = Number(process.env.AGENT_GATEWAY_IDEMPOTENCY_PENDING_TTL_SECONDS ?? 900);
-const idempotencyCompletedTtlSeconds = Number(process.env.AGENT_GATEWAY_IDEMPOTENCY_TTL_SECONDS ?? 86400);
+const idempotencyPendingTtlSeconds = envPositiveInteger("AGENT_GATEWAY_IDEMPOTENCY_PENDING_TTL_SECONDS", 900);
+const idempotencyCompletedTtlSeconds = envPositiveInteger("AGENT_GATEWAY_IDEMPOTENCY_TTL_SECONDS", 86400);
+const rateLimitRequests = envPositiveInteger("AGENT_GATEWAY_RATE_LIMIT_REQUESTS", 120);
+const rateLimitWindowSeconds = envPositiveInteger("AGENT_GATEWAY_RATE_LIMIT_WINDOW_SECONDS", 60);
+const maxConcurrency = envPositiveInteger("AGENT_GATEWAY_MAX_CONCURRENCY", 20);
+const concurrencyLeaseSeconds = envPositiveInteger("AGENT_GATEWAY_CONCURRENCY_LEASE_SECONDS", 300);
 
 async function readJson(req: http.IncomingMessage) {
   let raw = "";
@@ -176,12 +216,14 @@ function json(
 }
 
 function errorStatus(error: unknown) {
+  if (error instanceof GatewayAdmissionError) return 429;
   const message = error instanceof Error ? error.message : String(error);
   if (/Missing bearer token|Invalid API key|Invalid admin token/.test(message)) return 401;
   if (/admin token is not configured/.test(message)) return 503;
   if (/Session not found/.test(message)) return 404;
   if (/Session is not bound|Idempotency request is still in progress|Idempotency key was already used/.test(message)) return 409;
-  if (/Unknown channel|does not satisfy|No healthy channel|must be|required/.test(message)) return 400;
+  if (/Channel circuit is open|No healthy channel/.test(message)) return 503;
+  if (/Unknown channel|does not satisfy|must be|required/.test(message)) return 400;
   const code = (error as { code?: string } | null)?.code;
   if (code === "23505" || code === "23503") return 409;
   return 500;
@@ -204,6 +246,61 @@ function routeHints(req: http.IncomingMessage): RouteHints {
     requiredCapabilities,
     budget: Number.isFinite(maxCostUsd) ? { max_cost_usd: maxCostUsd } : undefined,
   };
+}
+
+function runtimeIdentity(context: GatewayRequestContext) {
+  return `${context.tenantId}:${context.virtualKeyId ?? context.projectId ?? "tenant"}`;
+}
+
+async function enforceRateLimit(context: GatewayRequestContext) {
+  if (!runtimeControls) return {} as Record<string, string>;
+  const decision = await runtimeControls.checkRateLimit({
+    key: runtimeIdentity(context),
+    limit: rateLimitRequests,
+    windowSeconds: rateLimitWindowSeconds,
+  });
+  const headers = {
+    "x-ratelimit-limit": String(decision.limit),
+    "x-ratelimit-remaining": String(decision.remaining),
+    "x-agent-gateway-ratelimit-reset-after": String(decision.resetAfterSeconds),
+  };
+  if (!decision.allowed) {
+    throw new GatewayAdmissionError("Rate limit exceeded", {
+      ...headers,
+      "retry-after": String(Math.max(1, decision.resetAfterSeconds)),
+      "x-agent-gateway-limit-type": "rate",
+    });
+  }
+  return headers;
+}
+
+async function withConcurrency<T>(context: GatewayRequestContext, run: () => Promise<T>): Promise<T> {
+  if (!runtimeControls) return run();
+  const decision = await runtimeControls.acquireConcurrency({
+    key: runtimeIdentity(context),
+    limit: maxConcurrency,
+    ttlSeconds: concurrencyLeaseSeconds,
+  });
+  if (!decision.acquired) {
+    throw new GatewayAdmissionError("Concurrency limit exceeded", {
+      "retry-after": String(decision.retryAfterSeconds),
+      "x-agent-gateway-limit-type": "concurrency",
+      "x-agent-gateway-concurrency-limit": String(maxConcurrency),
+    });
+  }
+
+  const heartbeatMs = Math.max(1000, Math.floor((concurrencyLeaseSeconds * 1000) / 3));
+  const heartbeat = setInterval(() => {
+    void runtimeControls.renewConcurrency(decision.lease, concurrencyLeaseSeconds).catch(() => undefined);
+  }, heartbeatMs);
+  heartbeat.unref();
+
+  try {
+    return await run();
+  } finally {
+    clearInterval(heartbeat);
+    await runtimeControls.releaseConcurrency(decision.lease).catch(() => undefined);
+  }
 }
 
 async function executeIdempotent<T>(input: {
@@ -309,15 +406,25 @@ http
 
       if (req.method === "GET" && path === "/health") {
         const database = persistence.database ? await persistence.database.health() : undefined;
-        return json(res, 200, { ok: true, service: "agent-gateway", persistence: database ? "postgres" : "memory", database });
+        const redis = runtimeControls ? await runtimeControls.health() : undefined;
+        const ok = (database?.ok ?? true) && (redis?.ok ?? true);
+        return json(res, ok ? 200 : 503, {
+          ok,
+          service: "agent-gateway",
+          persistence: database ? "postgres" : "memory",
+          runtime: redis ? "redis" : "disabled",
+          database,
+          redis,
+        });
       }
 
       if (await handleControlPlane(req, res, path)) return;
 
       const context = await persistence.authenticator.authenticate(req.headers.authorization);
+      const rateHeaders = await enforceRateLimit(context);
 
       if (req.method === "GET" && path === "/api/gateway/channels") {
-        return json(res, 200, await gateway.channels());
+        return json(res, 200, await gateway.channels(), rateHeaders);
       }
 
       if (req.method === "POST" && path === "/agents/sessions") {
@@ -328,7 +435,7 @@ http
               type: "gateway_not_implemented",
               message: "Streaming session creation is not implemented yet; create with stream=false then use the events stream endpoint.",
             },
-          });
+          }, rateHeaders);
         }
         const hints = routeHints(req);
         const result = await executeIdempotent({
@@ -336,42 +443,57 @@ http
           context,
           scope: "agents.sessions.create",
           request: { body, hints },
-          run: async () => ({ status: 201, body: await gateway.createSession(body, context, hints) }),
+          run: async () => ({
+            status: 201,
+            body: await withConcurrency(context, () => gateway.createSession(body, context, hints)),
+          }),
         });
-        return json(res, result.status, result.body, result.replay ? { "x-agent-gateway-idempotent-replay": "true" } : {});
+        return json(res, result.status, result.body, {
+          ...rateHeaders,
+          ...(result.replay ? { "x-agent-gateway-idempotent-replay": "true" } : {}),
+        });
       }
 
       let match = path.match(/^\/agents\/sessions\/([^/]+)$/);
       if (req.method === "GET" && match) {
-        return json(res, 200, await gateway.getSession(decodeURIComponent(match[1]), context));
+        const session = await withConcurrency(context, () => gateway.getSession(decodeURIComponent(match![1]), context));
+        return json(res, 200, session, rateHeaders);
       }
 
       match = path.match(/^\/agents\/sessions\/([^/]+)\/events$/);
       if (req.method === "POST" && match) {
-        await gateway.sendEvents(
-          decodeURIComponent(match[1]),
-          (await readJson(req)) as SessionEventBatch,
-          context,
-        );
-        res.writeHead(204);
+        const sessionId = decodeURIComponent(match[1]);
+        const events = (await readJson(req)) as SessionEventBatch;
+        await withConcurrency(context, () => gateway.sendEvents(sessionId, events, context));
+        res.writeHead(204, rateHeaders);
         return res.end();
       }
 
       if (req.method === "GET" && match) {
-        const stream = await gateway.streamEvents(decodeURIComponent(match[1]), context);
-        res.writeHead(200, {
-          "content-type": "text/event-stream; charset=utf-8",
-          "cache-control": "no-cache",
-          connection: "keep-alive",
+        const sessionId = decodeURIComponent(match[1]);
+        await withConcurrency(context, async () => {
+          const stream = await gateway.streamEvents(sessionId, context);
+          res.writeHead(200, {
+            "content-type": "text/event-stream; charset=utf-8",
+            "cache-control": "no-cache",
+            connection: "keep-alive",
+            ...rateHeaders,
+          });
+          for await (const chunk of stream) res.write(chunk);
+          res.end();
         });
-        for await (const chunk of stream) res.write(chunk);
-        return res.end();
+        return;
       }
 
-      return json(res, 404, { error: { type: "not_found", message: "Route not found" } });
+      return json(res, 404, { error: { type: "not_found", message: "Route not found" } }, rateHeaders);
     } catch (error) {
+      if (res.headersSent) {
+        res.destroy(error instanceof Error ? error : undefined);
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
-      return json(res, errorStatus(error), { error: { type: "gateway_error", message } });
+      const headers = error instanceof GatewayAdmissionError ? error.headers : {};
+      return json(res, errorStatus(error), { error: { type: "gateway_error", message } }, headers);
     }
   })
   .listen(port, () => console.log(`agent-gateway listening on :${port}`));

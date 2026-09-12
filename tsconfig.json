@@ -7,6 +7,7 @@
     {"path":"packages/provider-mock"},
     {"path":"packages/sdk"},
     {"path":"packages/storage-postgres"},
+    {"path":"packages/runtime-redis"},
     {"path":"apps/server"}
   ]
 }
