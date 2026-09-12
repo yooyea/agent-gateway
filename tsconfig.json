@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    {"path":"packages/protocol"},
+    {"path":"packages/core"},
+    {"path":"packages/provider-openai-agents"},
+    {"path":"packages/provider-mock"},
+    {"path":"packages/sdk"},
+    {"path":"apps/server"}
+  ]
+}
