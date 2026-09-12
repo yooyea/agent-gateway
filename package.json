@@ -1,8 +1,8 @@
 {
   "name": "agent-gateway",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Provider-agnostic agent runtime gateway with pluggable Agents API adapters.",
+  "description": "Open-source Agent API gateway for routing, tenancy, session affinity, metering and billing across agent runtimes.",
   "workspaces": ["apps/*", "packages/*"],
   "scripts": {
     "build": "tsc -b",
@@ -14,5 +14,5 @@
     "@types/node": "^22.15.0",
     "typescript": "^5.8.3"
   },
-  "engines": {"node": ">=22"}
+  "engines": { "node": ">=22" }
 }

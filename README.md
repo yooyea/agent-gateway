@@ -1,26 +1,101 @@
 # Agent Gateway
 
-A provider-agnostic **Agent Runtime Gateway** for products that need to use multiple Agents APIs without coupling themselves to one vendor.
+**Agent Gateway is an open-source Agent API gateway and SaaS control plane.**
 
-OpenAI Agents API is the first real provider. The architecture is deliberately plugin-based so Claude, Gemini, self-hosted harnesses, or future agent runtimes can be added without changing LineHalo or other products.
+It sits between any product and one or more upstream agent runtimes. The caller should not need to know which upstream account, credential, channel, sandbox, or provider actually executes a session.
 
-## Why
+The mental model is similar to an LLM API gateway, but the unit of routing and billing is no longer a stateless model request. It is a stateful **agent session and execution lifecycle**.
 
-Model gateways normalize `chat/completions`. Agent gateways need to normalize much more: durable sessions, runtime environments, events, tools, MCP, artifacts, approvals, subagents, files, secrets and cancellation.
+```text
+Any client / SaaS / IDE / CI
+            |
+      Virtual API Key
+            |
+            v
++-----------------------------+
+|        Agent Gateway        |
+|-----------------------------|
+| Auth / Tenant / Project     |
+| Session Router + Affinity   |
+| Channel Pool / Failover     |
+| Quota / Budget / Policy     |
+| Usage / Billing / Ledger    |
+| Audit / Trace / Metrics     |
++-------------+---------------+
+              |
+       Provider Channels
+       /       |        \
+ OpenAI     Claude*    Custom*
+ Agents API Agent SDK  Harness
+```
 
-The gateway therefore uses **capability negotiation**, not a lowest-common-denominator API.
+`*` is an architectural extension point, not necessarily an implemented provider.
+
+## Product boundary
+
+Agent Gateway is not tied to any upstream caller and not tied to any downstream provider.
+
+A product only knows:
+
+```text
+AGENT_BASE_URL=https://gateway.example.com
+AGENT_API_KEY=ag_xxx
+```
+
+The gateway owns provider credentials, channel selection, session affinity, policy enforcement, metering and settlement.
+
+## Why an Agent Gateway is different from a Model Gateway
+
+A model gateway primarily routes requests and meters tokens. An agent gateway must additionally preserve durable execution state:
+
+- sessions and turns
+- runtime environments and sandboxes
+- tools and MCP
+- approvals and required actions
+- artifacts and files
+- subagents
+- cancellation and event streams
+- long-running execution
+- per-session budgets
+- provider/session affinity
+- cost reservation and later reconciliation
+
+A live session cannot be freely moved between credentials or providers without explicit migration semantics. That makes **Session + Execution + Billing** the core architecture triangle.
 
 ## Repository layout
 
 ```text
-apps/server                    HTTP gateway
-packages/protocol              canonical Agent Runtime Protocol
-packages/core                  provider registry + capability router
-packages/provider-openai-agents OpenAI Agents API adapter
-packages/provider-mock         local/test provider
-packages/sdk                   product-facing TypeScript SDK
-docs/                          architecture + integration docs
+apps/server                       Data plane + bootstrap control plane
+packages/protocol                 Provider plugin contract and shared types
+packages/core                     Routing, session affinity, auth abstractions
+packages/provider-openai-agents   OpenAI Agents API adapter
+packages/provider-mock            Local/test provider
+packages/sdk                      Optional TypeScript client
+docs/product-spec.md              Product specification
+docs/architecture.md              System architecture
+docs/ontology.md                  Domain ontology and invariants
+docs/api-spec.md                  Northbound and management API contract
+docs/billing.md                   Metering, reservation and settlement model
+docs/provider-plugin.md           Provider/channel plugin contract
 ```
+
+## Current implementation
+
+`v0.2` establishes the correct foundation:
+
+- OpenAI Agents API-shaped data plane: `/agents/sessions`
+- virtual-key authentication with tenant/project context
+- stable gateway session IDs (`agsess_*`)
+- provider/channel separation
+- session affinity: every session remains pinned to its selected channel
+- capability-aware channel routing
+- channel priority/weight metadata
+- OpenAI Agents API adapter
+- event submission and event streaming
+- provider-native session fields preserved while the public session ID is rewritten
+- provider plugin architecture
+
+The current in-memory session store and environment-backed virtual-key store are bootstrap implementations. Production persistence, billing ledger and admin UI are specified in `docs/` and are the next implementation layers.
 
 ## Quick start
 
@@ -28,58 +103,62 @@ docs/                          architecture + integration docs
 cp .env.example .env
 npm install
 npm run build
-OPENAI_API_KEY=... npm start
+npm start
 ```
 
-List providers:
+Development virtual key when `AGENT_GATEWAY_KEYS` is not configured:
 
-```bash
-curl http://localhost:8787/v1/providers
+```text
+ag_dev_local
 ```
 
 Create a session:
 
 ```bash
-curl -X POST http://localhost:8787/v1/sessions \
+curl -X POST http://localhost:8787/agents/sessions \
+  -H 'authorization: Bearer ag_dev_local' \
   -H 'content-type: application/json' \
   -d '{
-    "requiredCapabilities":["durable_session","sandbox"],
-    "agent":{"instructions":"Build and verify a LineHalo plugin."},
-    "environment":{"type":"hosted"},
-    "input":"Create an indicator that highlights confirmed breakout retests."
+    "agent": {"model":"gpt-6-astra","instructions":"Inspect the repository and fix the task."},
+    "environment": {"type":"none"},
+    "input":"Find the highest-impact issue and fix it."
   }'
 ```
 
-## v0.1 scope
+Force a provider or channel without changing the Agents API request body:
 
-Implemented now:
-- canonical session protocol
-- runtime-loaded provider plugin registry
-- capability-aware selection
-- OpenAI Agents API session create/get/input/cancel mapping
-- mock provider
-- HTTP gateway
-- TypeScript SDK skeleton
-- LineHalo integration architecture
+```bash
+-H 'x-agent-gateway-provider: openai-agents'
+-H 'x-agent-gateway-channel: openai-primary'
+-H 'x-agent-gateway-max-cost-usd: 2.00'
+```
 
-Next engineering steps:
-- persistent session directory
-- SSE/WebSocket event normalization
-- tool-result / approval round trips
-- provider hot reload / zero-downtime refresh
-- auth / tenancy / quota / audit
-- provider contract test kit
-- policies for cost/latency/reliability routing
-- additional provider adapters
+List channels:
 
-## OpenAI mapping
+```bash
+curl http://localhost:8787/api/gateway/channels \
+  -H 'authorization: Bearer ag_dev_local'
+```
 
-The first provider maps to OpenAI's managed Agents API endpoints such as `POST /agents/sessions`, `GET /agents/sessions/{id}`, and `POST /agents/sessions/{id}/events`.
+## Design rule: compatibility outside, governance inside
 
-This repository treats those endpoints as one provider implementation rather than the public contract products consume.
+The data plane follows the upstream Agents API shape as closely as practical. Gateway-specific routing and policy are carried through headers so ordinary clients do not need a gateway-specific request schema.
 
-## Switching providers
+The control plane is separate under `/api/gateway/*` and owns tenants, projects, keys, channels, pricing, budgets, usage, billing, audit and administration.
 
-A product may choose a provider explicitly per session or let the gateway route by required capabilities. This gives LineHalo free provider choice without vendor coupling.
+## Roadmap
 
-The gateway intentionally does **not** pretend that a live durable session can be moved losslessly between vendors. Cross-provider handoff will be a separate migration capability: export canonical task/context/artifacts, create a new provider session, then attach lineage. That keeps semantics explicit instead of hiding state loss.
+The implementation order is intentionally infrastructure-first:
+
+1. durable Postgres session directory and idempotency
+2. Redis-backed concurrency/rate limiting
+3. virtual-key/project/tenant persistence and RBAC
+4. usage meter + immutable ledger
+5. session budget reservation and hard-stop policy
+6. provider cost reconciliation
+7. channel health, circuit breaking and failover policy
+8. admin/dashboard APIs
+9. additional provider adapters
+10. explicit cross-provider migration instead of pretending sessions are stateless
+
+See the documents in `docs/` for the normative design.
