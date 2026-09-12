@@ -2,6 +2,7 @@ import type { GatewayRequestContext, SessionRecord, SessionStore } from "@agent-
 import type { GatewaySession } from "@agent-gateway/protocol";
 import {
   BillingInsufficientFundsError,
+  PostgresBillingStore,
   SessionBudgetExceededError,
   usdToMicros,
   type BillingAccountRecord,
@@ -43,6 +44,13 @@ export class SessionBudgetRequiredError extends Error {
   }
 }
 
+export class BillingPricingUnavailableError extends Error {
+  constructor(readonly sessionId: string, readonly usageEventId?: string) {
+    super(`Customer pricing is unavailable for billed session: ${sessionId}`);
+    this.name = "BillingPricingUnavailableError";
+  }
+}
+
 function positiveInteger(value: number, name: string) {
   if (!Number.isInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
   return value;
@@ -58,6 +66,120 @@ function reservationExpiry(record: SessionRecord, fallbackSeconds: number) {
     ? Math.max(fallbackSeconds, Math.ceil(declared))
     : fallbackSeconds;
   return new Date(Date.now() + seconds * 1000).toISOString();
+}
+
+/**
+ * Postgres Data Plane adapter adds hot-path invariants that are intentionally stricter
+ * than generic accounting storage: billed usage must have an explicit customer price,
+ * and an operational Reservation TTL must be renewable without becoming a hidden
+ * Session lifetime limit.
+ */
+export class PostgresDataPlaneBillingStore extends PostgresBillingStore {
+  private readonly reservationRenewalTtlSeconds: number;
+
+  constructor(connectionString: string, options: { reservationRenewalTtlSeconds?: number } = {}) {
+    super(connectionString);
+    this.reservationRenewalTtlSeconds = positiveInteger(
+      options.reservationRenewalTtlSeconds ?? 86_400,
+      "reservationRenewalTtlSeconds",
+    );
+  }
+
+  private async assertCustomerPricing(sessionId: string) {
+    const result = await this.pool.query(
+      `SELECT ue.id
+       FROM gateway_usage_events ue
+       LEFT JOIN gateway_usage_settlements us ON us.usage_event_id=ue.id
+       LEFT JOIN gateway_ledger_entries le
+         ON le.usage_event_id=ue.id AND le.book='customer'
+       WHERE ue.session_id=$1
+         AND (us.usage_event_id IS NULL OR us.state='no_price' OR le.id IS NULL)
+       ORDER BY ue.measured_at, ue.created_at
+       LIMIT 1`,
+      [sessionId],
+    );
+    if (result.rows[0]) {
+      throw new BillingPricingUnavailableError(sessionId, String(result.rows[0].id));
+    }
+  }
+
+  private async renewReservationIfNeeded(sessionId: string) {
+    await this.withTransaction(async (client) => {
+      const identity = await client.query(
+        `SELECT tenant_id FROM gateway_reservations WHERE session_id=$1 LIMIT 1`,
+        [sessionId],
+      );
+      if (!identity.rows[0]) return;
+      const tenantId = String(identity.rows[0].tenant_id);
+
+      // Match normal Reservation admission lock order: BillingAccount first, then
+      // Reservation. This prevents renewal from racing a new Session for the same capacity.
+      const exposureResult = await client.query(
+        `SELECT
+           a.credit_limit_micros,
+           a.enabled,
+           COALESCE((
+             SELECT SUM(CASE WHEN direction='credit' THEN amount_micros ELSE -amount_micros END)
+             FROM gateway_ledger_entries le
+             WHERE le.book='customer' AND le.tenant_id=a.tenant_id
+           ),0)::bigint AS ledger_balance_micros,
+           COALESCE((
+             SELECT SUM(GREATEST(0,amount_micros-consumed_micros))
+             FROM gateway_reservations r
+             WHERE r.tenant_id=a.tenant_id AND r.state='active' AND r.expires_at > now()
+           ),0)::bigint AS reserved_micros
+         FROM gateway_billing_accounts a
+         WHERE a.tenant_id=$1
+         FOR UPDATE`,
+        [tenantId],
+      );
+      const exposure = exposureResult.rows[0];
+      if (!exposure) throw new Error(`Billing account not found: ${tenantId}`);
+      if (!exposure.enabled) throw new Error(`Billing account disabled: ${tenantId}`);
+
+      const reservationResult = await client.query(
+        `SELECT id,amount_micros,consumed_micros,state,expires_at
+         FROM gateway_reservations
+         WHERE session_id=$1
+         LIMIT 1
+         FOR UPDATE`,
+        [sessionId],
+      );
+      const reservation = reservationResult.rows[0];
+      if (!reservation || reservation.state !== "active") return;
+
+      const remaining = BigInt(reservation.amount_micros) - BigInt(reservation.consumed_micros);
+      if (remaining <= 0n) return;
+
+      const expired = new Date(reservation.expires_at).getTime() <= Date.now();
+      if (expired) {
+        // Expired Reservations no longer count as held capacity, so reacquire the
+        // remaining amount under the BillingAccount lock before letting work resume.
+        const available = BigInt(exposure.credit_limit_micros)
+          + BigInt(exposure.ledger_balance_micros)
+          - BigInt(exposure.reserved_micros);
+        if (available < remaining) {
+          throw new BillingInsufficientFundsError(available, remaining);
+        }
+      }
+
+      await client.query(
+        `UPDATE gateway_reservations
+         SET expires_at=$2,updated_at=now()
+         WHERE id=$1 AND state='active'`,
+        [
+          reservation.id,
+          new Date(Date.now() + this.reservationRenewalTtlSeconds * 1000).toISOString(),
+        ],
+      );
+    });
+  }
+
+  override async assertSessionBudget(sessionId: string) {
+    await this.assertCustomerPricing(sessionId);
+    await this.renewReservationIfNeeded(sessionId);
+    return super.assertSessionBudget(sessionId);
+  }
 }
 
 /**
