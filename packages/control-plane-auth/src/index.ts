@@ -337,11 +337,6 @@ export class PostgresControlPlaneSecurity {
     this.attachTransactionalPool(this.pool);
   }
 
-  /**
-   * Makes another pg Pool participate in this security store's transaction context.
-   * This is used by the durable gateway store so a resource mutation and its AuditEvent
-   * commit or roll back together even though the repositories are separate modules.
-   */
   attachTransactionalPool(pool: Pool) {
     if (this.wrappedPools.has(pool)) return;
     this.wrappedPools.add(pool);
@@ -373,13 +368,8 @@ export class PostgresControlPlaneSecurity {
     }
   }
 
-  async close() {
-    await this.pool.end();
-  }
-
-  async migrate() {
-    await this.pool.query(SCHEMA_SQL);
-  }
+  async close() { await this.pool.end(); }
+  async migrate() { await this.pool.query(SCHEMA_SQL); }
 
   async createPrincipal(input: {
     id: string;
@@ -390,8 +380,7 @@ export class PostgresControlPlaneSecurity {
   }) {
     const result = await this.pool.query(
       `INSERT INTO gateway_control_principals(id, name, token_hash, token_prefix, expires_at)
-       VALUES ($1,$2,$3,$4,$5)
-       RETURNING *`,
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
       [input.id, input.name, input.tokenHash, input.tokenPrefix, input.expiresAt ?? null],
     );
     return principalFromRow(result.rows[0]);
@@ -400,18 +389,15 @@ export class PostgresControlPlaneSecurity {
   async listPrincipals() {
     const result = await this.pool.query(
       `SELECT id, name, token_prefix, enabled, expires_at, created_at
-       FROM gateway_control_principals
-       ORDER BY created_at DESC`,
+       FROM gateway_control_principals ORDER BY created_at DESC`,
     );
     return result.rows.map(principalFromRow);
   }
 
   async setPrincipalEnabled(id: string, enabled: boolean) {
     const result = await this.pool.query(
-      `UPDATE gateway_control_principals
-       SET enabled = $2, updated_at = now()
-       WHERE id = $1
-       RETURNING id, name, token_prefix, enabled, expires_at, created_at`,
+      `UPDATE gateway_control_principals SET enabled=$2,updated_at=now()
+       WHERE id=$1 RETURNING id,name,token_prefix,enabled,expires_at,created_at`,
       [id, enabled],
     );
     if (!result.rows[0]) throw new Error(`Control principal not found: ${id}`);
@@ -420,22 +406,16 @@ export class PostgresControlPlaneSecurity {
 
   async authenticateTokenHash(tokenHash: string): Promise<ControlPlaneActor | undefined> {
     const principal = await this.pool.query(
-      `SELECT id, name, token_hash, enabled, expires_at
-       FROM gateway_control_principals
-       WHERE token_hash = $1`,
+      `SELECT id,name,token_hash,enabled,expires_at FROM gateway_control_principals WHERE token_hash=$1`,
       [tokenHash],
     );
     const row = principal.rows[0];
     if (!row || !row.enabled) return undefined;
     if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) return undefined;
-
     const bindings = await this.pool.query(
-      `SELECT * FROM gateway_role_bindings
-       WHERE principal_id = $1
-       ORDER BY created_at ASC`,
+      `SELECT * FROM gateway_role_bindings WHERE principal_id=$1 ORDER BY created_at ASC`,
       [row.id],
     );
-
     return {
       id: String(row.id),
       name: String(row.name),
@@ -456,29 +436,22 @@ export class PostgresControlPlaneSecurity {
     scopeId?: string;
   }) {
     const result = await this.pool.query(
-      `INSERT INTO gateway_role_bindings(id, principal_id, role, scope_type, scope_id)
-       VALUES ($1,$2,$3,$4,$5)
-       RETURNING *`,
-      [input.id, input.principalId, input.role, input.scopeType, input.scopeId ?? null],
+      `INSERT INTO gateway_role_bindings(id,principal_id,role,scope_type,scope_id)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [input.id,input.principalId,input.role,input.scopeType,input.scopeId ?? null],
     );
     return bindingFromRow(result.rows[0]);
   }
 
   async listRoleBindings(principalId?: string) {
     const result = principalId
-      ? await this.pool.query(
-        `SELECT * FROM gateway_role_bindings WHERE principal_id = $1 ORDER BY created_at DESC`,
-        [principalId],
-      )
+      ? await this.pool.query(`SELECT * FROM gateway_role_bindings WHERE principal_id=$1 ORDER BY created_at DESC`, [principalId])
       : await this.pool.query(`SELECT * FROM gateway_role_bindings ORDER BY created_at DESC`);
     return result.rows.map(bindingFromRow);
   }
 
   async deleteRoleBinding(id: string) {
-    const result = await this.pool.query(
-      `DELETE FROM gateway_role_bindings WHERE id = $1 RETURNING *`,
-      [id],
-    );
+    const result = await this.pool.query(`DELETE FROM gateway_role_bindings WHERE id=$1 RETURNING *`, [id]);
     if (!result.rows[0]) throw new Error(`Role binding not found: ${id}`);
     return bindingFromRow(result.rows[0]);
   }
@@ -486,23 +459,10 @@ export class PostgresControlPlaneSecurity {
   async appendAudit(input: AuditEventInput) {
     const result = await this.pool.query(
       `INSERT INTO gateway_audit_events(
-         id, actor_type, actor_id, actor_name, request_id,
-         action, resource_type, resource_id, tenant_id, outcome, metadata
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)
-       RETURNING *`,
-      [
-        input.id,
-        input.actor.kind,
-        input.actor.id,
-        input.actor.name,
-        input.requestId,
-        input.action,
-        input.resourceType,
-        input.resourceId ?? null,
-        input.tenantId ?? null,
-        input.outcome,
-        JSON.stringify(input.metadata ?? {}),
-      ],
+         id,actor_type,actor_id,actor_name,request_id,action,resource_type,resource_id,tenant_id,outcome,metadata
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb) RETURNING *`,
+      [input.id,input.actor.kind,input.actor.id,input.actor.name,input.requestId,input.action,input.resourceType,
+        input.resourceId ?? null,input.tenantId ?? null,input.outcome,JSON.stringify(input.metadata ?? {})],
     );
     return auditFromRow(result.rows[0]);
   }
@@ -531,40 +491,62 @@ export class PostgresControlPlaneSecurity {
     const result = await this.pool.query(
       `SELECT * FROM gateway_audit_events
        ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
-       ORDER BY created_at DESC
-       LIMIT $${values.length}`,
+       ORDER BY created_at DESC LIMIT $${values.length}`,
       values,
     );
     return result.rows.map(auditFromRow);
+  }
+
+  async purgeExpiredControlIdempotency(limit = 1000) {
+    const safeLimit = Math.max(1, Math.min(10_000, Math.trunc(limit)));
+    const result = await this.pool.query(
+      `DELETE FROM gateway_control_idempotency
+       WHERE ctid IN (
+         SELECT ctid FROM gateway_control_idempotency
+         WHERE expires_at <= now()
+         ORDER BY expires_at ASC
+         LIMIT $1
+       )`,
+      [safeLimit],
+    );
+    return result.rowCount ?? 0;
   }
 
   async claimControlIdempotency(input: ControlIdempotencyClaimInput): Promise<ControlIdempotencyClaimResult> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      // Opportunistically clean unrelated expired records on every mutation so abandoned
+      // one-shot keys cannot grow without bound. Exact-key cleanup remains mandatory so a
+      // large backlog can never block reuse of this specific expired key.
+      await client.query(
+        `DELETE FROM gateway_control_idempotency
+         WHERE ctid IN (
+           SELECT ctid FROM gateway_control_idempotency
+           WHERE expires_at <= now()
+           ORDER BY expires_at ASC
+           LIMIT 1000
+         )`,
+      );
       await client.query(
         `DELETE FROM gateway_control_idempotency
          WHERE actor_id=$1 AND scope=$2 AND idempotency_key=$3 AND expires_at <= now()`,
-        [input.actorId, input.scope, input.key],
+        [input.actorId,input.scope,input.key],
       );
       const inserted = await client.query(
-        `INSERT INTO gateway_control_idempotency(
-           actor_id, scope, idempotency_key, request_hash, state, expires_at
-         ) VALUES ($1,$2,$3,$4,'pending',$5)
-         ON CONFLICT DO NOTHING
-         RETURNING request_hash`,
-        [input.actorId, input.scope, input.key, input.requestHash, input.expiresAt],
+        `INSERT INTO gateway_control_idempotency(actor_id,scope,idempotency_key,request_hash,state,expires_at)
+         VALUES ($1,$2,$3,$4,'pending',$5) ON CONFLICT DO NOTHING RETURNING request_hash`,
+        [input.actorId,input.scope,input.key,input.requestHash,input.expiresAt],
       );
       if (inserted.rowCount === 1) {
         await client.query("COMMIT");
         return { state: "claimed" };
       }
       const existing = await client.query(
-        `SELECT request_hash, state, response_status, response_envelope
+        `SELECT request_hash,state,response_status,response_envelope
          FROM gateway_control_idempotency
-         WHERE actor_id=$1 AND scope=$2 AND idempotency_key=$3
-         FOR UPDATE`,
-        [input.actorId, input.scope, input.key],
+         WHERE actor_id=$1 AND scope=$2 AND idempotency_key=$3 FOR UPDATE`,
+        [input.actorId,input.scope,input.key],
       );
       const row = existing.rows[0];
       await client.query("COMMIT");
@@ -597,19 +579,9 @@ export class PostgresControlPlaneSecurity {
   }) {
     const result = await this.pool.query(
       `UPDATE gateway_control_idempotency
-       SET state='completed', response_status=$5, response_envelope=$6,
-           expires_at=$7, updated_at=now()
-       WHERE actor_id=$1 AND scope=$2 AND idempotency_key=$3
-         AND request_hash=$4 AND state='pending'`,
-      [
-        input.actorId,
-        input.scope,
-        input.key,
-        input.requestHash,
-        input.responseStatus,
-        input.responseEnvelope,
-        input.expiresAt,
-      ],
+       SET state='completed',response_status=$5,response_envelope=$6,expires_at=$7,updated_at=now()
+       WHERE actor_id=$1 AND scope=$2 AND idempotency_key=$3 AND request_hash=$4 AND state='pending'`,
+      [input.actorId,input.scope,input.key,input.requestHash,input.responseStatus,input.responseEnvelope,input.expiresAt],
     );
     if (result.rowCount !== 1) throw new Error("Control plane idempotency claim not found");
   }
@@ -622,9 +594,8 @@ export class PostgresControlPlaneSecurity {
   }) {
     await this.pool.query(
       `DELETE FROM gateway_control_idempotency
-       WHERE actor_id=$1 AND scope=$2 AND idempotency_key=$3
-         AND request_hash=$4 AND state='pending'`,
-      [input.actorId, input.scope, input.key, input.requestHash],
+       WHERE actor_id=$1 AND scope=$2 AND idempotency_key=$3 AND request_hash=$4 AND state='pending'`,
+      [input.actorId,input.scope,input.key,input.requestHash],
     );
   }
 }
