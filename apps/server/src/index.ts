@@ -599,7 +599,8 @@ http.createServer(async (req, res) => {
     match = path.match(/^\/agents\/sessions\/([^/]+)\/events$/);
     if (req.method === "POST" && match) {
       const sessionId = decodeURIComponent(match[1]);
-      await withConcurrency(context, () => gateway.sendEvents(sessionId, (await readJson(req)) as SessionEventBatch, context));
+      const events = (await readJson(req)) as SessionEventBatch;
+      await withConcurrency(context, () => gateway.sendEvents(sessionId, events, context));
       res.writeHead(204, rateHeaders); return res.end();
     }
     if (req.method === "GET" && match) {
