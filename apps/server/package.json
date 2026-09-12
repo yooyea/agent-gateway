@@ -10,6 +10,7 @@
     "@agent-gateway/provider-openai-agents": "0.2.0",
     "@agent-gateway/provider-mock": "0.2.0",
     "@agent-gateway/protocol": "0.2.0",
+    "@agent-gateway/runtime-redis": "0.2.0",
     "@agent-gateway/storage-postgres": "0.2.0"
   }
 }

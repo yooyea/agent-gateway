@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Redis runtime controls
+
+- Added `@agent-gateway/runtime-redis` for operational hot-path state.
+- Added fixed-window request rate limiting per Virtual Key using atomic Redis Lua operations.
+- Added concurrency leases with ZSET expiry, explicit release and heartbeat renewal for long-running streams/tasks.
+- Added read-through/write-through Session cache while preserving Postgres as the durable source of truth.
+- Added Channel circuit-breaker failure windows and open TTLs.
+- Open circuits affect only new Session routing; existing Session Bindings remain pinned to their original Channel.
+- Added `429` admission responses with `Retry-After` and limit-type metadata.
+- Added Redis to Docker Compose and GitHub Actions integration tests.
+- Added a core regression test covering circuit-breaker routing without violating Session Affinity.
+
 ## 0.2.0 - 2026-09-12
 
 ### Reframed
