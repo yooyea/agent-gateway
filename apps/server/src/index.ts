@@ -18,11 +18,12 @@ import {
   type SessionStore,
   type VirtualKeyRecord,
 } from "@agent-gateway/core";
-import { PostgresBillingStore } from "@agent-gateway/billing-postgres";
 import {
   BillingInsufficientFundsError,
+  BillingPricingUnavailableError,
   BillingSessionStore,
   DataPlaneBilling,
+  PostgresDataPlaneBillingStore,
   SessionBudgetExceededError,
   SessionBudgetRequiredError,
 } from "@agent-gateway/billing-runtime";
@@ -119,7 +120,7 @@ async function createPersistence(): Promise<{
   authenticator: GatewayAuthenticator;
   database?: PostgresGatewayStore;
   controlSecurity?: PostgresControlPlaneSecurity;
-  billing?: PostgresBillingStore;
+  billing?: PostgresDataPlaneBillingStore;
 }> {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
@@ -133,10 +134,13 @@ async function createPersistence(): Promise<{
 
   const store = new PostgresGatewayStore(databaseUrl);
   const controlSecurity = new PostgresControlPlaneSecurity(databaseUrl);
-  const billing = new PostgresBillingStore(databaseUrl);
-  // A Control Plane transaction may mutate resources through PostgresGatewayStore and
-  // append Audit/Idempotency records through PostgresControlPlaneSecurity. Route both
-  // repository query paths through the same transaction client.
+  const reservationTtlSeconds = envPositiveInteger(
+    "AGENT_GATEWAY_SESSION_RESERVATION_TTL_SECONDS",
+    86_400,
+  );
+  const billing = new PostgresDataPlaneBillingStore(databaseUrl, {
+    reservationRenewalTtlSeconds: reservationTtlSeconds,
+  });
   controlSecurity.attachTransactionalPool(store.pool);
 
   const autoMigrate = process.env.AGENT_GATEWAY_AUTO_MIGRATE === "true" ||
@@ -374,6 +378,7 @@ function errorStatus(error: unknown) {
   if (error instanceof BillingInsufficientFundsError) return 402;
   if (error instanceof SessionBudgetRequiredError) return 402;
   if (error instanceof SessionBudgetExceededError) return 429;
+  if (error instanceof BillingPricingUnavailableError) return 503;
   if (error instanceof GatewayAdmissionError) return 429;
   const message = error instanceof Error ? error.message : String(error);
   if (/Billing account disabled/.test(message)) return 402;
@@ -403,6 +408,12 @@ function errorHeaders(error: unknown) {
     return {
       "x-agent-gateway-limit-type": "budget",
       "x-agent-gateway-budget-remaining-micros": error.remainingMicros.toString(),
+    };
+  }
+  if (error instanceof BillingPricingUnavailableError) {
+    return {
+      "x-agent-gateway-limit-type": "billing_price_unavailable",
+      ...(error.usageEventId ? { "x-agent-gateway-usage-event-id": error.usageEventId } : {}),
     };
   }
   const message = error instanceof Error ? error.message : String(error);
@@ -467,18 +478,23 @@ async function enforceRateLimit(context: GatewayRequestContext) {
   return headers;
 }
 
-async function withConcurrency<T>(context: GatewayRequestContext, run: () => Promise<T>): Promise<T> {
-  if (!runtimeControls) return run();
+async function withLease<T>(input: {
+  key: string;
+  limit: number;
+  limitType: string;
+  run: () => Promise<T>;
+}): Promise<T> {
+  if (!runtimeControls) return input.run();
   const decision = await runtimeControls.acquireConcurrency({
-    key: runtimeIdentity(context),
-    limit: maxConcurrency,
+    key: input.key,
+    limit: input.limit,
     ttlSeconds: concurrencyLeaseSeconds,
   });
   if (!decision.acquired) {
     throw new GatewayAdmissionError("Concurrency limit exceeded", {
       "retry-after": String(decision.retryAfterSeconds),
-      "x-agent-gateway-limit-type": "concurrency",
-      "x-agent-gateway-concurrency-limit": String(maxConcurrency),
+      "x-agent-gateway-limit-type": input.limitType,
+      "x-agent-gateway-concurrency-limit": String(input.limit),
     });
   }
   const heartbeatMs = Math.max(1000, Math.floor((concurrencyLeaseSeconds * 1000) / 3));
@@ -487,11 +503,29 @@ async function withConcurrency<T>(context: GatewayRequestContext, run: () => Pro
   }, heartbeatMs);
   heartbeat.unref();
   try {
-    return await run();
+    return await input.run();
   } finally {
     clearInterval(heartbeat);
     await runtimeControls.releaseConcurrency(decision.lease).catch(() => undefined);
   }
+}
+
+function withConcurrency<T>(context: GatewayRequestContext, run: () => Promise<T>) {
+  return withLease({
+    key: runtimeIdentity(context),
+    limit: maxConcurrency,
+    limitType: "concurrency",
+    run,
+  });
+}
+
+function withSessionConcurrency<T>(sessionId: string, run: () => Promise<T>) {
+  return withLease({
+    key: `session:${sessionId}`,
+    limit: 1,
+    limitType: "session_concurrency",
+    run,
+  });
 }
 
 async function releaseDataPlaneIdempotency(input: {
@@ -507,6 +541,14 @@ async function releaseDataPlaneIdempotency(input: {
        AND request_hash=$5 AND state='pending'`,
     [input.context.tenantId, input.context.virtualKeyId, input.scope, input.key, input.requestHash],
   );
+}
+
+function knownPreProviderFailure(error: unknown) {
+  if (error instanceof BillingInsufficientFundsError) return true;
+  if (error instanceof SessionBudgetRequiredError) return true;
+  if (error instanceof GatewayAdmissionError) return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /Billing account disabled/.test(message);
 }
 
 async function executeIdempotent<T>(input: {
@@ -543,12 +585,17 @@ async function executeIdempotent<T>(input: {
   try {
     result = await input.run();
   } catch (error) {
-    await releaseDataPlaneIdempotency({
-      context: input.context,
-      scope: input.scope,
-      key,
-      requestHash,
-    }).catch(() => undefined);
+    // Release only failures that are proven to occur before any Provider side effect.
+    // Unknown failures remain pending until TTL/reconciliation because provider Session
+    // creation may already have succeeded even when local binding persistence failed.
+    if (knownPreProviderFailure(error)) {
+      await releaseDataPlaneIdempotency({
+        context: input.context,
+        scope: input.scope,
+        key,
+        requestHash,
+      }).catch(() => undefined);
+    }
     throw error;
   }
 
@@ -703,11 +750,11 @@ http.createServer(async (req, res) => {
       const sessionId = decodeURIComponent(match[1]);
       const sessionContext = await scopedSessionContext(sessionId, context);
       const events = (await readJson(req)) as SessionEventBatch;
-      await withConcurrency(sessionContext, async () => {
+      await withConcurrency(sessionContext, () => withSessionConcurrency(sessionId, async () => {
         await assertBudgetBeforeProviderWork(sessionId, sessionContext);
         await gateway.sendEvents(sessionId, events, sessionContext);
         await reconcileSessionUsageBestEffort(sessionId, sessionContext);
-      });
+      }));
       res.writeHead(204, rateHeaders);
       return res.end();
     }
@@ -715,7 +762,7 @@ http.createServer(async (req, res) => {
     if (req.method === "GET" && match) {
       const sessionId = decodeURIComponent(match[1]);
       const sessionContext = await scopedSessionContext(sessionId, context);
-      await withConcurrency(sessionContext, async () => {
+      await withConcurrency(sessionContext, () => withSessionConcurrency(sessionId, async () => {
         await assertBudgetBeforeProviderWork(sessionId, sessionContext);
         const stream = await gateway.streamEvents(sessionId, sessionContext);
         res.writeHead(200, {
@@ -730,7 +777,7 @@ http.createServer(async (req, res) => {
         } finally {
           await reconcileSessionUsageBestEffort(sessionId, sessionContext);
         }
-      });
+      }));
       return;
     }
 
