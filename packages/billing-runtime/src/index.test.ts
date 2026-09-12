@@ -148,7 +148,7 @@ test("billed tenant without a hard session budget fails before provider work", a
   const base = new MemorySessionStore();
   const billing = new FakeBilling();
   const store = new BillingSessionStore(base, billing);
-  const record = sessionRecord(undefined);
+  const record = sessionRecord({});
 
   await assert.rejects(store.create(record), SessionBudgetRequiredError);
   assert.equal(base.records.get(record.id)?.state, "failed");
@@ -160,7 +160,7 @@ test("unbilled tenant preserves legacy session behavior", async () => {
   const billing = new FakeBilling();
   billing.account = undefined;
   const store = new BillingSessionStore(base, billing);
-  const record = sessionRecord(undefined);
+  const record = sessionRecord({});
 
   await store.create(record);
   assert.equal(base.records.get(record.id)?.state, "creating");
