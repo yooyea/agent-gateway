@@ -101,15 +101,8 @@ function assertNonSecretConfig(value: unknown, path = "config") {
   for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
     const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
     if ([
-      "apikey",
-      "token",
-      "accesstoken",
-      "refreshtoken",
-      "secret",
-      "clientsecret",
-      "password",
-      "authorization",
-      "credential",
+      "apikey", "token", "accesstoken", "refreshtoken", "secret",
+      "clientsecret", "password", "authorization", "credential",
     ].some((needle) => normalized.includes(needle))) {
       throw new Error(`Sensitive field ${path}.${key} must be stored as a Credential`);
     }
@@ -143,8 +136,6 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
     idempotencyCompletedTtlSeconds,
   } = deps;
 
-  // Resource mutations use PostgresGatewayStore while Audit/RBAC use the security store.
-  // Route both repositories through the same transaction client when withTransaction is active.
   security.attachTransactionalPool(store.pool);
 
   async function authenticate(req: http.IncomingMessage): Promise<ControlPlaneActor> {
@@ -215,6 +206,9 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
     const key = typeof raw === "string" ? raw.trim() : undefined;
     if (!key) return undefined;
     if (key.length > 256) throw new Error("Idempotency-Key must be at most 256 characters");
+
+    // The full request participates in the fingerprint, including secret payload values.
+    // Only the hash is persisted; the plaintext request is never written to idempotency/audit storage.
     const requestHash = stableRequestHash(input.request);
     const context = idempotencyContext(input.actor.id, input.scope, key);
     const claim = await security.claimControlIdempotency({
@@ -231,7 +225,10 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
       throw new Error("Control plane idempotency request is still in progress");
     }
     if (claim.state === "replay") {
-      const decoded = credentialKeyring.decrypt<{ status: number; body: unknown }>(claim.responseEnvelope, context);
+      const decoded = credentialKeyring.decrypt<{ status: number; body: unknown }>(
+        claim.responseEnvelope,
+        context,
+      );
       return {
         state: "replay" as const,
         status: Number(decoded.status ?? claim.responseStatus),
@@ -282,17 +279,21 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
     resultResourceId?: (result: T) => string | undefined;
   }): Promise<MutationResult<T>> {
     await authorize(input);
-    const idem = await beginIdempotency({
-      req: input.req,
-      actor: input.actor,
-      scope: input.action,
-      request: input.request,
-    });
-    if (idem?.state === "replay") {
-      return { status: idem.status, body: idem.body as T, replay: true };
-    }
+    let idem: Awaited<ReturnType<typeof beginIdempotency>>;
 
+    // Idempotency claim/decryption is inside the audited error boundary. Authenticated
+    // conflicts, in-progress retries, and replay-decryption failures therefore leave evidence.
     try {
+      idem = await beginIdempotency({
+        req: input.req,
+        actor: input.actor,
+        scope: input.action,
+        request: input.request,
+      });
+      if (idem?.state === "replay") {
+        return { status: idem.status, body: idem.body as T, replay: true };
+      }
+
       const result = await security.withTransaction(async () => {
         const body = await input.run();
         await appendAudit({
@@ -323,8 +324,6 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
             outcome: "error",
             metadata: { error: error instanceof Error ? error.message : String(error) },
           }).catch(() => undefined);
-          // Durable mutation already committed. Keep the API result successful rather than
-          // creating a false retry signal that could duplicate a one-time-secret operation.
           console.error("control-plane runtime reload failed", error);
         }
       }
@@ -371,7 +370,7 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
     return result;
   }
 
-  function mutationHeaders(rid: string, result: MutationResult<unknown>) {
+  function mutationHeaders<T>(rid: string, result: MutationResult<T>) {
     return {
       "x-request-id": rid,
       ...(result.replay ? { "x-agent-gateway-idempotent-replay": "true" } : {}),
@@ -405,7 +404,9 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
 
       if (req.method === "POST" && path === "/api/gateway/admin/projects") {
         const body = await readJson(req) as { tenant_id?: string; name?: string };
-        if (!body.tenant_id?.trim() || !body.name?.trim()) throw new Error("tenant_id and project name are required");
+        if (!body.tenant_id?.trim() || !body.name?.trim()) {
+          throw new Error("tenant_id and project name are required");
+        }
         const tenantId = body.tenant_id.trim();
         const result = await mutate({
           req, actor, requestId: rid, permission: "projects.write", action: "project.create",
@@ -418,8 +419,15 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
       }
 
       if (req.method === "POST" && path === "/api/gateway/admin/virtual-keys") {
-        const body = await readJson(req) as { tenant_id?: string; project_id?: string; name?: string; expires_at?: string };
-        if (!body.tenant_id?.trim() || !body.name?.trim()) throw new Error("tenant_id and key name are required");
+        const body = await readJson(req) as {
+          tenant_id?: string;
+          project_id?: string;
+          name?: string;
+          expires_at?: string;
+        };
+        if (!body.tenant_id?.trim() || !body.name?.trim()) {
+          throw new Error("tenant_id and key name are required");
+        }
         if (body.expires_at && !Number.isFinite(new Date(body.expires_at).getTime())) {
           throw new Error("expires_at must be a valid date-time");
         }
@@ -456,7 +464,12 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
       }
 
       if (req.method === "POST" && path === "/api/gateway/admin/providers") {
-        const body = await readJson(req) as { type?: string; display_name?: string; enabled?: boolean; config?: unknown };
+        const body = await readJson(req) as {
+          type?: string;
+          display_name?: string;
+          enabled?: boolean;
+          config?: unknown;
+        };
         const type = body.type?.trim();
         if (!type || !moduleCatalog[type]) throw new Error(`Unknown provider type: ${type ?? ""}`);
         const config = body.config === undefined ? {} : recordObject(body.config, "config");
@@ -485,7 +498,8 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
         if (config) assertNonSecretConfig(config);
         const result = await mutate({
           req, actor, requestId: rid, permission: "providers.write", action: "provider.update",
-          resourceType: "provider", resourceId: id, request: { id, body }, status: 200, reloadRuntime: true,
+          resourceType: "provider", resourceId: id, request: { id, body }, status: 200,
+          reloadRuntime: true,
           run: () => store.updateProvider(id, {
             displayName: body.display_name?.trim() || undefined,
             enabled: body.enabled,
@@ -506,7 +520,12 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
       }
 
       if (req.method === "POST" && path === "/api/gateway/admin/credentials") {
-        const body = await readJson(req) as { provider_id?: string; name?: string; kind?: string; payload?: unknown };
+        const body = await readJson(req) as {
+          provider_id?: string;
+          name?: string;
+          kind?: string;
+          payload?: unknown;
+        };
         if (!body.provider_id?.trim() || !body.name?.trim()) {
           throw new Error("provider_id and credential name are required");
         }
@@ -514,7 +533,11 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
         const providerId = body.provider_id.trim();
         const result = await mutate({
           req, actor, requestId: rid, permission: "credentials.write", action: "credential.create",
-          resourceType: "credential", request: { ...body, payload: "<redacted>" }, status: 201,
+          resourceType: "credential",
+          // Secret values participate in the in-memory fingerprint so a changed secret conflicts.
+          // The request itself is not persisted; audit metadata remains redacted below.
+          request: body,
+          status: 201,
           metadata: { provider_id: providerId, kind: body.kind?.trim() || "generic" },
           run: async () => {
             const id = prefixedId("agcred");
@@ -541,9 +564,9 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
         const body = await readJson(req) as { payload?: unknown };
         const payload = recordObject(body.payload, "payload");
         const result = await mutate({
-          req, actor, requestId: rid, permission: "credentials.write", action: "credential.secret.replace",
-          resourceType: "credential", resourceId: id, request: { id, payload: "<redacted>" }, status: 200,
-          reloadRuntime: true,
+          req, actor, requestId: rid, permission: "credentials.write",
+          action: "credential.secret.replace", resourceType: "credential", resourceId: id,
+          request: { id, payload }, status: 200, reloadRuntime: true,
           run: async () => {
             const existing = await store.getEncryptedCredential(id);
             if (!existing) throw new Error(`Credential not found: ${id}`);
@@ -565,6 +588,7 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
         const result = await mutate({
           req, actor, requestId: rid, permission: "credentials.rewrap", action: "credential.rewrap",
           resourceType: "credential", resourceId: id, request: { id }, status: 200,
+          reloadRuntime: true,
           run: async () => {
             const existing = await store.getEncryptedCredential(id);
             if (!existing) throw new Error(`Credential not found: ${id}`);
@@ -578,7 +602,6 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
               algorithm: encrypted.algorithm,
             });
           },
-          reloadRuntime: true,
         });
         json(res, result.status, result.body, mutationHeaders(rid, result));
         return true;
@@ -800,7 +823,12 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
         return true;
       }
 
-      json(res, 404, { error: { type: "not_found", message: "Control plane route not found" } }, responseHeaders);
+      json(
+        res,
+        404,
+        { error: { type: "not_found", message: "Control plane route not found" } },
+        responseHeaders,
+      );
       return true;
     } catch (error) {
       if (res.headersSent) {
