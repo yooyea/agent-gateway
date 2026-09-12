@@ -207,8 +207,6 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
     if (!key) return undefined;
     if (key.length > 256) throw new Error("Idempotency-Key must be at most 256 characters");
 
-    // The full request participates in the fingerprint, including secret payload values.
-    // Only the hash is persisted; the plaintext request is never written to idempotency/audit storage.
     const requestHash = stableRequestHash(input.request);
     const context = idempotencyContext(input.actor.id, input.scope, key);
     const claim = await security.claimControlIdempotency({
@@ -281,8 +279,6 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
     await authorize(input);
     let idem: Awaited<ReturnType<typeof beginIdempotency>>;
 
-    // Idempotency claim/decryption is inside the audited error boundary. Authenticated
-    // conflicts, in-progress retries, and replay-decryption failures therefore leave evidence.
     try {
       idem = await beginIdempotency({
         req: input.req,
@@ -291,7 +287,18 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
         request: input.request,
       });
       if (idem?.state === "replay") {
-        return { status: idem.status, body: idem.body as T, replay: true };
+        const replayBody = idem.body as T;
+        await appendAudit({
+          actor: input.actor,
+          requestId: input.requestId,
+          action: input.action,
+          resourceType: input.resourceType,
+          resourceId: input.resultResourceId?.(replayBody) ?? input.resourceId,
+          tenantId: input.tenantId,
+          outcome: "success",
+          metadata: { ...input.metadata, idempotent_replay: true },
+        });
+        return { status: idem.status, body: replayBody, replay: true };
       }
 
       const result = await security.withTransaction(async () => {
@@ -533,11 +540,7 @@ export function createControlPlaneHandler(deps: ControlPlaneDependencies) {
         const providerId = body.provider_id.trim();
         const result = await mutate({
           req, actor, requestId: rid, permission: "credentials.write", action: "credential.create",
-          resourceType: "credential",
-          // Secret values participate in the in-memory fingerprint so a changed secret conflicts.
-          // The request itself is not persisted; audit metadata remains redacted below.
-          request: body,
-          status: 201,
+          resourceType: "credential", request: body, status: 201,
           metadata: { provider_id: providerId, kind: body.kind?.trim() || "generic" },
           run: async () => {
             const id = prefixedId("agcred");
