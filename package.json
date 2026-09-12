@@ -1,13 +1,13 @@
 {
   "name": "agent-gateway",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Open-source Agent API gateway for routing, tenancy, session affinity, metering and billing across agent runtimes.",
   "workspaces": ["apps/*", "packages/*"],
   "scripts": {
     "build": "tsc -b",
     "check": "tsc -b --pretty false",
-    "test": "npm run build && node --test packages/core/dist/index.test.js packages/storage-postgres/dist/index.test.js packages/runtime-redis/dist/index.test.js",
+    "test": "npm run build && node --test packages/core/dist/index.test.js packages/credential-crypto/dist/index.test.js packages/storage-postgres/dist/index.test.js packages/runtime-redis/dist/index.test.js",
     "dev": "npm run build && node apps/server/dist/index.js",
     "start": "node apps/server/dist/index.js"
   },

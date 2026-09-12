@@ -31,22 +31,52 @@ Agent Gateway is independent infrastructure between arbitrary callers and hetero
 
 The first implementation serves both planes from one Node process. The boundary is logical and must remain explicit so the planes can be split later.
 
-## 2. Provider is not Channel
+## 2. Provider, Channel and Credential
 
-`Provider` describes a runtime implementation such as `openai-agents`.
+`Provider` describes a runtime adapter implementation such as `openai-agents`.
 
-`Channel` is one routable upstream configuration:
+`Channel` is one routable instance of a Provider:
 
 ```text
 Provider: openai-agents
-  |- Channel: openai-account-a
-  |- Channel: openai-account-b
-  |- Channel: enterprise-openai-project-x
+  |- Channel: openai-account-a -> Credential A
+  |- Channel: openai-account-b -> Credential B
+  |- Channel: enterprise-x     -> Credential C
 ```
 
-A Channel owns or references credentials, endpoint/account identity, priority/weight, health, capacity constraints and cost metadata.
+`Credential` contains encrypted provider authentication material. It belongs to one Provider and may be referenced only by Channels of that Provider.
 
-## 3. Session affinity and durable binding
+Provider and Channel configuration is non-secret. Endpoint, default model, priority and weight may be queried normally. API keys/tokens/passwords belong in Credential payloads.
+
+When Postgres is enabled, Provider/Channel/Credential records are the runtime source of truth. The server maps Provider type to a trusted installed plugin, decrypts the Credential in memory, merges Provider + Channel + Credential configuration, and instantiates the adapter.
+
+Database values cannot import arbitrary plugin modules. Trusted module mapping is server/environment configuration.
+
+Control-plane changes rebuild the in-memory ProviderRegistry. Stable Channel IDs preserve SessionBinding resolution across reloads.
+
+## 3. Credential security boundary
+
+Credential payloads are encrypted with AES-256-GCM before durable storage.
+
+```text
+Runtime master keyring (env/KMS boundary)
+                 |
+                 v
+        CredentialKeyring
+                 |
+      encrypt / decrypt / rewrap
+                 |
+                 v
+Postgres: ciphertext + key id + algorithm
+```
+
+Master keys never enter Postgres.
+
+Authenticated data binds ciphertext to Credential ID and Provider ID, preventing a ciphertext from being moved to another resource without authentication failure.
+
+Multiple decrypt keys may coexist while one key is active for new encryption. Rotation keeps the old key available until every Credential has been rewrapped to the new active key.
+
+## 4. Session affinity and durable binding
 
 A new request follows:
 
@@ -82,109 +112,105 @@ agsess_123
   -> state=bound
 ```
 
-Every later operation resolves the binding first:
+Every later operation resolves the binding first. It must not be load-balanced again.
 
-```text
-agsess_123 -> openai-account-a -> session_xyz
-```
+Disabling a Channel or opening its circuit excludes it from new Session routing. It does not remove the Channel from the registry and does not move existing bound Sessions.
 
-It must not be load-balanced again.
+## 5. Routing
 
-## 4. Routing
-
-Routing only applies when a new session is created or when an explicit migration operation creates a replacement session.
+Routing applies when a new Session is created or when an explicit future migration creates a replacement Session.
 
 Selection pipeline:
 
-1. requested explicit channel, if any
-2. provider constraint
+1. explicit Channel, if requested
+2. Provider constraint
 3. tenant/project allow policy
 4. required capabilities
 5. enabled state
-6. health/circuit-breaker state
-7. capacity/rate/concurrency availability
+6. circuit/health state
+7. rate/concurrency/capacity availability
 8. priority tier
 9. weighted selection inside the tier
 10. optional cost/latency/reliability scoring
 
-The current implementation establishes capability filtering plus priority/weight metadata. Production routing policy and channel health will later move into durable + Redis-backed services.
-
-## 5. Data Plane
+## 6. Data Plane
 
 Responsibilities:
 
 - authenticate hashed Virtual Keys
 - derive Tenant/Project context
-- enforce policy
-- create gateway session IDs
-- resolve durable Session Bindings
-- proxy/map events
-- stream events
+- enforce rate/concurrency/policy
+- create gateway Session IDs
+- resolve durable SessionBindings
+- proxy/map events and streams
 - persist idempotency decisions
 - emit usage/trace records
-- enforce active budget/concurrency decisions
+- enforce active budget decisions
 
-It should avoid administrative joins or expensive analytics on the hot path.
+The Data Plane should avoid administrative joins or analytics on the hot path.
 
-## 6. Control Plane
+## 7. Control Plane
 
 Responsibilities:
 
 - tenant/user/project lifecycle
 - virtual-key lifecycle
-- provider/channel/credential management
-- price tables
-- route policy
+- Provider/Channel/Credential lifecycle
+- trusted provider-plugin catalog
+- routing policy
 - quota/budget policy
-- wallet/invoice configuration
+- pricing / wallet / invoice configuration
 - usage reconciliation
 - audit and operator workflows
 
-The bootstrap implementation exposes admin-token protected create endpoints for Tenant, Project and Virtual Key. Full RBAC replaces the bootstrap admin token later.
+Provider/Channel/Credential mutations currently trigger an in-process registry rebuild. A future distributed Control Plane should publish versioned configuration changes rather than relying on process-local reload.
 
-## 7. Persistence
+## 8. Persistence
 
-### Postgres
+### Postgres — durable truth
 
-Implemented source of truth now:
+Implemented source of truth:
 
-- tenants/projects
-- virtual keys (hashed secret + prefix)
-- session bindings and binding lifecycle
-- idempotency records and replay response
+- tenants / projects
+- virtual keys (hash + prefix)
+- Providers
+- encrypted Credentials + encryption metadata
+- Channels
+- SessionBindings and binding lifecycle
+- idempotency records + replay responses
 
-Planned Postgres source of truth:
+Future durable domains:
 
-- users/RBAC
-- providers/channels/credential references
-- routing decisions
+- users / RBAC / memberships
+- routing policies
 - usage events
 - price snapshots
 - reservations
 - ledger entries
-- audit logs
+- audit events
 
-### Redis
+### Redis — reconstructable runtime state
 
-Planned operational state for:
+Implemented operational state:
 
-- rate limits
+- request rate-limit windows
 - concurrency leases
-- hot session routing cache
-- channel health/circuit breaker
-- short-lived idempotency acceleration
+- hot Session cache
+- Channel circuit state
 
-Redis is never the financial or session-affinity source of truth.
+Redis is never the financial, Credential or Session-affinity source of truth.
 
-## 8. Idempotency
+### Runtime secret boundary
 
-Session creation uses `Idempotency-Key` scoped by Tenant + Virtual Key + operation. The request fingerprint includes the data-plane body and routing hints.
+Credential master encryption keys live outside Postgres/Redis. Environment variables provide the initial implementation; KMS/HSM-backed key material can replace that boundary without changing Credential records.
 
-A completed request replays the original response. A reused key with a different fingerprint fails. A concurrent request for a pending key fails as in-progress rather than creating a second upstream session.
+## 9. Idempotency
 
-Session-event idempotency remains compatible with the provider body field `idempotency_key`.
+Session creation uses `Idempotency-Key` scoped by Tenant + VirtualKey + operation. The fingerprint includes the Data Plane body and routing hints.
 
-## 9. Billing pipeline
+A completed request replays the original response. A reused key with a different fingerprint fails. A concurrent request for a pending key fails as in-progress rather than creating a second upstream Session.
+
+## 10. Billing pipeline
 
 ```text
 Provider/runtime events
@@ -208,30 +234,31 @@ Provider Reconciliation
 Immutable Ledger
 ```
 
-Provider session `usage` is evidence, not the ledger itself.
+Provider Session `usage` is evidence, not the ledger itself.
 
-## 10. Reliability
+## 11. Reliability
 
-For new sessions, unhealthy channels can be skipped or circuit-broken.
+For new Sessions, disabled, unhealthy or circuit-open Channels are skipped.
 
-For an existing session, channel failure must not cause transparent rerouting to another provider because provider-native session state would be lost. The gateway exposes the failed/degraded state and may later offer explicit migration/recovery.
+For an existing Session, Channel failure must not cause transparent rerouting because provider-native state would be lost. The gateway exposes the failure and may later offer explicit migration/recovery.
 
-The durable `creating/bound/failed` binding state makes partially completed creation observable instead of silently losing the selected route.
+Runtime-registry rebuilds must preserve Channel IDs. If a persisted Channel required by an existing Session is deleted in the future, deletion semantics must account for active bindings rather than causing an implicit migration.
 
-## 11. Security
+## 12. Security
 
-- upstream provider credentials never reach callers
-- durable Virtual Key secrets are SHA-256 hashed at rest
-- plaintext Virtual Key is returned only once at creation
-- all data-plane access resolves a Tenant context
-- session IDs are Tenant-isolated
-- credential access belongs to a narrow provider execution boundary
-- logs must redact bearer tokens and provider secrets
-- financial/admin operations require RBAC and audit entries
-- development bootstrap credentials are forbidden as a production mechanism
+- upstream provider Credentials never reach callers
+- Provider/Channel config rejects secret-like fields
+- Credential ciphertext is authenticated and bound to Credential + Provider identity
+- Credential master keys never live in Postgres
+- Control Plane Credential responses never return ciphertext or plaintext
+- durable Virtual Keys are SHA-256 hashed at rest
+- all Data Plane access resolves a Tenant context
+- logs/traces must redact caller and provider secrets
+- administrative mutations require RBAC + audit in the next Control Plane layer
+- development bootstrap secrets are forbidden as a production mechanism
 
-## 12. Extensibility
+## 13. Extensibility
 
-Provider packages implement a small adapter interface. The core knows Channels and capabilities, not vendor SDKs.
+Provider packages implement a small adapter interface. Core routing knows Channels and capabilities, not vendor SDKs.
 
-A provider may expose native fields in its session payload. The gateway rewrites the public session ID and appends `gateway.provider/channel` metadata instead of flattening every provider into a lowest-common-denominator object.
+A Provider may expose native fields in its Session payload. The gateway rewrites the public Session ID and appends `gateway.provider/channel` metadata rather than flattening every Provider into a lowest-common-denominator object.
