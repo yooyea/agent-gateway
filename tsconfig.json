@@ -3,6 +3,7 @@
   "references": [
     {"path":"packages/protocol"},
     {"path":"packages/core"},
+    {"path":"packages/credential-crypto"},
     {"path":"packages/provider-openai-agents"},
     {"path":"packages/provider-mock"},
     {"path":"packages/sdk"},

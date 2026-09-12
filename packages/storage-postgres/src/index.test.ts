@@ -10,7 +10,7 @@ import { PostgresGatewayStore } from "./index.js";
 
 const databaseUrl = process.env.DATABASE_URL;
 
-test("postgres persistence closes the identity, session and idempotency loop", { skip: !databaseUrl }, async () => {
+test("postgres persistence closes identity, runtime configuration, session and idempotency loops", { skip: !databaseUrl }, async () => {
   const store = new PostgresGatewayStore(databaseUrl!);
   const suffix = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
   const tenantId = `tenant_test_${suffix}`;
@@ -18,6 +18,9 @@ test("postgres persistence closes the identity, session and idempotency loop", {
   const virtualKeyId = `vk_test_${suffix}`;
   const secret = `ag_test_${suffix}`;
   const sessionId = `agsess_test_${suffix}`;
+  const providerId = `agprov_test_${suffix}`;
+  const credentialId = `agcred_test_${suffix}`;
+  const channelId = `agch_test_${suffix}`;
 
   try {
     await store.migrate();
@@ -33,11 +36,54 @@ test("postgres persistence closes the identity, session and idempotency loop", {
     });
 
     const auth = new StoreBackedVirtualKeyAuthenticator(store);
-    assert.deepEqual(await auth.authenticate(`Bearer ${secret}`), {
-      tenantId,
-      projectId,
-      virtualKeyId,
+    assert.deepEqual(await auth.authenticate(`Bearer ${secret}`), { tenantId, projectId, virtualKeyId });
+
+    await store.createProvider({
+      id: providerId,
+      type: `mock-${suffix}`,
+      displayName: "Integration provider",
+      config: { region: "test" },
     });
+    await store.createCredential({
+      id: credentialId,
+      providerId,
+      name: "integration credential",
+      kind: "api_key",
+      encryptedPayload: `encrypted:${suffix}`,
+      encryptionKeyId: "test-key",
+      algorithm: "aes-256-gcm",
+    });
+    await store.createChannel({
+      id: channelId,
+      providerId,
+      credentialId,
+      name: "Integration channel",
+      priority: 20,
+      weight: 50,
+      config: { baseUrl: "https://example.invalid" },
+    });
+
+    const runtime = await store.listRuntimeChannels();
+    const runtimeChannel = runtime.find((item) => item.id === channelId);
+    assert.equal(runtimeChannel?.providerId, providerId);
+    assert.equal(runtimeChannel?.providerType, `mock-${suffix}`);
+    assert.equal(runtimeChannel?.credential?.encryptedPayload, `encrypted:${suffix}`);
+    assert.deepEqual(runtimeChannel?.providerConfig, { region: "test" });
+    assert.deepEqual(runtimeChannel?.config, { baseUrl: "https://example.invalid" });
+
+    const listedCredentials = await store.listCredentials();
+    const redacted = listedCredentials.find((item) => item.id === credentialId) as Record<string, unknown> | undefined;
+    assert.ok(redacted);
+    assert.equal("encryptedPayload" in redacted!, false);
+
+    const otherProviderId = `agprov_other_${suffix}`;
+    await store.createProvider({ id: otherProviderId, type: `other-${suffix}`, displayName: "Other provider" });
+    await assert.rejects(() => store.createChannel({
+      id: `agch_wrong_${suffix}`,
+      providerId: otherProviderId,
+      credentialId,
+      name: "Wrong credential provider",
+    }));
 
     const now = new Date().toISOString();
     const creating: SessionRecord = {
@@ -45,15 +91,14 @@ test("postgres persistence closes the identity, session and idempotency loop", {
       tenantId,
       projectId,
       virtualKeyId,
-      provider: "mock",
-      channelId: "mock-default",
+      provider: `mock-${suffix}`,
+      channelId,
       state: "creating",
       createdAt: now,
       updatedAt: now,
     };
     await store.create(creating);
     assert.equal((await store.get(sessionId))?.state, "creating");
-
     const bound: SessionRecord = {
       ...creating,
       state: "bound",
@@ -64,9 +109,9 @@ test("postgres persistence closes the identity, session and idempotency loop", {
     const persisted = await store.get(sessionId);
     assert.equal(persisted?.state, "bound");
     assert.equal(persisted?.providerSessionId, `provider_${suffix}`);
-    assert.equal(persisted?.channelId, "mock-default");
+    assert.equal(persisted?.channelId, channelId);
 
-    const requestHash = stableRequestHash({ input: "hello", channel: "mock-default" });
+    const requestHash = stableRequestHash({ input: "hello", channel: channelId });
     const claim = {
       tenantId,
       virtualKeyId,
@@ -96,6 +141,9 @@ test("postgres persistence closes the identity, session and idempotency loop", {
     );
   } finally {
     await store.pool.query("DELETE FROM gateway_sessions WHERE tenant_id = $1", [tenantId]).catch(() => undefined);
+    await store.pool.query("DELETE FROM gateway_channels WHERE id LIKE $1", [`%${suffix}`]).catch(() => undefined);
+    await store.pool.query("DELETE FROM gateway_credentials WHERE id LIKE $1", [`%${suffix}`]).catch(() => undefined);
+    await store.pool.query("DELETE FROM gateway_providers WHERE id LIKE $1", [`%${suffix}`]).catch(() => undefined);
     await store.pool.query("DELETE FROM gateway_tenants WHERE id = $1", [tenantId]).catch(() => undefined);
     await store.close();
   }
