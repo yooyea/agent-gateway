@@ -88,6 +88,55 @@ POST /api/gateway/admin/role-bindings
 4. Store the Principal token in the operator's secret manager.
 5. Use that token for normal Control Plane work.
 
+## Mutation transaction boundary
+
+A successful Control Plane mutation is one atomic durable unit:
+
+```text
+resource mutation
++ success AuditEvent
++ completed idempotency replay record (when Idempotency-Key is present)
+= one Postgres transaction
+```
+
+The resource repository and the Control Plane security repository share the same transaction client while this unit runs.
+
+If any step fails before commit, all three durable effects roll back together. The gateway then appends a separate `outcome=error` AuditEvent after rollback. This prevents the API from reporting a failed one-time-secret operation after the resource was actually committed.
+
+Runtime-only work such as rebuilding the in-process Channel registry occurs **after** the durable transaction commits. A runtime reload failure is audited separately and must not convert an already committed durable mutation into a retryable API failure.
+
+## Control Plane idempotency
+
+Every Control Plane mutation accepts:
+
+```http
+Idempotency-Key: caller-generated-key
+```
+
+The durable scope is:
+
+```text
+actor + operation + Idempotency-Key
+```
+
+The full semantic request participates in the request fingerprint, including secret-bearing Credential payload values. Only the hash is persisted; request plaintext is not written to idempotency or audit storage.
+
+Outcomes:
+
+- first request claims a pending record and executes;
+- same key + different fingerprint returns conflict;
+- same key + same fingerprint while pending returns in-progress conflict;
+- completed request replays the original status/body and returns `X-Agent-Gateway-Idempotent-Replay: true`;
+- expired rows may be reclaimed.
+
+Completed replay bodies can include one-time Principal or Virtual Key secrets, so the replay body is encrypted with the Credential keyring before durable storage.
+
+Idempotency claim/decryption errors occur inside the audited mutation error boundary. Authenticated conflict, in-progress and replay-decryption failures therefore leave error audit evidence.
+
+A completed replay is also a security-relevant successful Control Plane request. The replay path records audit evidence using the **current** `X-Request-Id`, while the underlying resource mutation is not executed again.
+
+Expired idempotency rows are cleaned opportunistically in bounded batches on mutation traffic, with exact-key expiry cleanup guaranteeing that a large backlog cannot block reuse of the current expired key. The persistence layer also exposes a bounded explicit purge operation for maintenance.
+
 ## Audit trail
 
 Every successful Control Plane mutation is appended to `gateway_audit_events`.
@@ -121,7 +170,7 @@ This protects the audit history from accidental application-level mutation. Prod
 
 Control Plane responses include `X-Request-Id`.
 
-If the caller sends `X-Request-Id`, it is retained (up to 256 characters); otherwise the gateway creates one. The same id is persisted on the audit event so API failures can be correlated with the audit trail.
+If the caller sends `X-Request-Id`, it is retained (up to 256 characters); otherwise the gateway creates one. The same id is persisted on the audit event so API failures and idempotent replays can be correlated with the audit trail.
 
 ## Audit API
 
@@ -144,6 +193,9 @@ Tenant-scoped callers must specify their tenant id and can only access events fo
 
 - Principal tokens are never stored in plaintext.
 - RBAC decisions happen before a mutation reaches the durable resource store.
+- Resource mutation, success audit, and idempotency completion commit atomically.
+- Failed durable transactions do not leave a success AuditEvent or completed replay record behind.
+- Authenticated idempotency rejections and completed replays produce audit evidence.
 - Denied authenticated operations produce audit evidence.
 - RBAC management requires a global `owner` permission path.
 - Audit rows are append-only.
