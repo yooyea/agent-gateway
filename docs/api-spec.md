@@ -30,7 +30,7 @@ The Principal resolves to Role Bindings and permissions.
 
 The environment value `AGENT_GATEWAY_ADMIN_TOKEN` remains supported only as bootstrap / break-glass access. It is represented internally as a synthetic global owner and is not stored in Postgres.
 
-Control Plane responses include:
+Control Plane responses, including errors, include:
 
 ```http
 X-Request-Id: req_...
@@ -276,7 +276,7 @@ Create example:
 
 A Channel may reference only a Credential owned by the same Provider.
 
-Provider/Channel mutations and Credential secret replacement rebuild the in-process runtime registry. Stable Channel IDs preserve existing SessionBinding resolution.
+Provider/Channel mutations and Credential secret replacement rebuild the in-process runtime registry after the durable Control Plane transaction commits. Stable Channel IDs preserve existing SessionBinding resolution.
 
 ### Runtime Channel view
 
@@ -323,7 +323,7 @@ Create response includes a one-time plaintext token:
 }
 ```
 
-The full token is never returned again.
+The full token is never returned again except when an idempotent retry replays the original encrypted-at-rest response.
 
 `PATCH` currently supports enable/disable:
 
@@ -388,9 +388,9 @@ outcome=success|denied|error
 
 A caller with only a tenant-scoped `audit.read` binding must supply the matching `tenant_id`. Global callers may query without a tenant filter.
 
-Audit events are append-only and include the same `X-Request-Id` returned by the Control Plane response.
+Audit events are append-only and include the same `X-Request-Id` returned by the Control Plane response, including error responses.
 
-Successful mutations, mutation errors, authenticated authorization denials, and sensitive RBAC/Credential/audit reads generate audit evidence.
+Successful mutations, mutation errors, authenticated authorization denials, idempotency conflicts/in-progress failures, and sensitive RBAC/Credential/audit reads generate audit evidence.
 
 ## 12. Credential encryption configuration
 
@@ -432,19 +432,45 @@ Provider-native errors may be retained in protected traces/audit data, but secre
 
 ## 14. Idempotency semantics
 
+### Data Plane Session creation
+
 Session creation uses `Idempotency-Key` scoped by:
 
 ```text
 Tenant + VirtualKey + operation + Idempotency-Key
 ```
 
-Outcomes:
+### Control Plane mutations
+
+Every current management mutation under `/api/gateway/admin/*` accepts the same HTTP header:
+
+```http
+Idempotency-Key: caller-generated-key
+```
+
+Control Plane keys are scoped by:
+
+```text
+ControlPrincipal (or bootstrap actor) + operation/action + Idempotency-Key
+```
+
+The request fingerprint includes the complete semantic request. Secret Credential payload values participate in the in-memory hash so changing a secret with the same key is a conflict; only the SHA-256 fingerprint is persisted. Secret request bodies are not copied into idempotency or Audit rows.
+
+Outcomes for both Data Plane and Control Plane claims are:
 
 - first request: claim pending and execute
 - same key, different fingerprint: `409`
 - same key, same fingerprint while pending: `409` in progress
 - same key after completion: replay original response
 - after TTL expiry: key may be claimed again
+
+A Control Plane replay adds:
+
+```http
+X-Agent-Gateway-Idempotent-Replay: true
+```
+
+Control Plane replay envelopes are encrypted at rest with the gateway Credential keyring. This is required because a replay can contain a one-time Principal token or Virtual Key secret. Resource mutation, success AuditEvent, and idempotency completion commit atomically in one Postgres transaction. On failure the resource and success audit roll back together; the gateway then appends a separate error AuditEvent.
 
 Session input/tool events continue to use the upstream-compatible body field `idempotency_key`.
 

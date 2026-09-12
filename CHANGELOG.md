@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.1 - 2026-09-12
+
+### Control Plane correctness hardening
+
+- Control Plane resource mutations and their success AuditEvents now commit atomically in one Postgres transaction.
+- Added actor-scoped Control Plane `Idempotency-Key` persistence for management mutations.
+- Idempotency responses that may contain one-time secrets are encrypted before durable replay storage.
+- Principal and Virtual Key creation can now safely replay the original one-time secret response after a lost response/retry.
+- Mutation failures roll back the resource, success audit, and idempotency completion together; pending idempotency claims are released after rollback.
+- Control Plane error responses now preserve the same `X-Request-Id` used by authorization-denial and mutation-error AuditEvents.
+- Split the Control Plane HTTP implementation out of the Data Plane server entrypoint so RBAC, audit, transaction and idempotency semantics have one explicit boundary.
+- Runtime-registry reload happens only after the durable Control Plane transaction commits, preventing rolled-back Channel/Provider changes from leaking into in-memory routing state.
+
+### Validation
+
+- Added Postgres coverage proving an external gateway-resource mutation and AuditEvent roll back/commit together through the shared transaction context.
+- Added actor-scoped Control Plane idempotency claim/replay/conflict coverage.
+- Existing append-only Audit, RBAC, credential, Postgres, Redis and Session Affinity tests remain part of the release gate.
+
 ## 0.4.0 - 2026-09-12
 
 ### Control Plane RBAC

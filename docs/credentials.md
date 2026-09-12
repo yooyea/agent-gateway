@@ -102,6 +102,8 @@ All keys in the keyring may decrypt existing records. Only the active key is use
 
 Production fails closed when an explicit credential keyring is not configured.
 
+The same authenticated keyring also protects completed Control Plane idempotency replay envelopes because those responses may contain one-time Principal or Virtual Key secrets. Credential ciphertext and replay-envelope ciphertext therefore share one key-retention domain.
+
 ## 6. Master-key rotation
 
 Rotation is intentionally two-phase:
@@ -116,9 +118,22 @@ POST /api/gateway/admin/credentials/{credential_id}/rewrap
 ```
 
 5. Verify persisted Credentials reference the new `encryption_key_id`.
-6. Only then remove the old master key from the runtime keyring.
+6. Keep the old key available until no unexpired Control Plane idempotency replay envelope can require it.
+7. Purge expired Control Plane idempotency records, then remove the old key only after both retention conditions are true.
 
 Rewrap decrypts with the original key and immediately encrypts with the active key. The provider secret itself is unchanged.
+
+A Credential rewrap does **not** rewrap already completed idempotency replay envelopes. Consequently, after the old key stops being active it must remain in the runtime keyring for at least the maximum completed replay TTL (`AGENT_GATEWAY_IDEMPOTENCY_TTL_SECONDS`, default 86400 seconds) since the last envelope could have been encrypted with that key.
+
+Safe key removal invariant:
+
+```text
+no Credential references the old key
+AND
+no unexpired Control Plane replay envelope can require the old key
+```
+
+Removing the key earlier can make an otherwise valid idempotent retry unable to replay the original one-time secret response.
 
 ## 7. Provider-secret rotation
 
@@ -132,7 +147,13 @@ PATCH /api/gateway/admin/credentials/{credential_id}
 
 with a new `payload` object. The payload is encrypted with the currently active master key and the runtime registry is rebuilt.
 
-## 8. Redaction rules
+## 8. Idempotency replay retention
+
+Completed Control Plane replay bodies are encrypted with the Credential keyring and kept only until their completion TTL. The runtime opportunistically cleans expired rows on mutations and also exposes a bounded purge operation in the persistence layer for maintenance/tests.
+
+Replay records are not Credentials, but they can contain secret-bearing responses, so key-retirement procedures must account for them exactly as they account for Credential ciphertext.
+
+## 9. Redaction rules
 
 Control-plane list responses expose Credential metadata only:
 
@@ -147,7 +168,7 @@ They never return `encrypted_payload`, decrypted secret values or master keys.
 
 Application logs, traces and audit events must follow the same rule.
 
-## 9. Session-affinity consequence
+## 10. Session-affinity consequence
 
 Credential or Channel changes affect the adapter registered under a stable Channel ID. They do not authorize silently moving an existing SessionBinding to another Channel.
 
