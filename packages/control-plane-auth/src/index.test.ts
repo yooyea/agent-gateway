@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { Pool } from "pg";
 import {
   bootstrapActor,
   hasPermission,
@@ -35,9 +36,13 @@ test("tenant-scoped viewer only applies inside its tenant", () => {
   assert.throws(() => requirePermission(actor, "channels.write", "tenant-a"));
 });
 
-test("Postgres RBAC and append-only audit trail", { skip: !databaseUrl }, async () => {
+test("Postgres RBAC, control idempotency and atomic audit transaction", { skip: !databaseUrl }, async () => {
   const security = new PostgresControlPlaneSecurity(databaseUrl!);
+  const external = new Pool({ connectionString: databaseUrl! });
+  security.attachTransactionalPool(external);
   await security.migrate();
+  await external.query(`CREATE TABLE IF NOT EXISTS gateway_control_tx_probe(id text PRIMARY KEY)`);
+
   const suffix = Math.random().toString(16).slice(2);
   const principalId = `agcp_${suffix}`;
   const secret = `agcp_test_${suffix}`;
@@ -84,7 +89,70 @@ test("Postgres RBAC and append-only audit trail", { skip: !databaseUrl }, async 
     /append-only/,
   );
 
+  const idem = {
+    actorId: principalId,
+    scope: "principal.create",
+    key: `idem-${suffix}`,
+    requestHash: "a".repeat(64),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  };
+  assert.deepEqual(await security.claimControlIdempotency(idem), { state: "claimed" });
+  assert.deepEqual(await security.claimControlIdempotency(idem), { state: "in_progress" });
+  await security.completeControlIdempotency({
+    ...idem,
+    responseStatus: 201,
+    responseEnvelope: "encrypted-response",
+  });
+  assert.deepEqual(await security.claimControlIdempotency(idem), {
+    state: "replay",
+    responseStatus: 201,
+    responseEnvelope: "encrypted-response",
+  });
+  assert.deepEqual(await security.claimControlIdempotency({ ...idem, requestHash: "b".repeat(64) }), {
+    state: "conflict",
+  });
+
+  const rollbackProbe = `rollback_${suffix}`;
+  const rollbackAudit = `agaud_rollback_${suffix}`;
+  await assert.rejects(
+    security.withTransaction(async () => {
+      await external.query("INSERT INTO gateway_control_tx_probe(id) VALUES ($1)", [rollbackProbe]);
+      await security.appendAudit({
+        id: rollbackAudit,
+        actor,
+        requestId: `req_rollback_${suffix}`,
+        action: "probe.create",
+        resourceType: "probe",
+        resourceId: rollbackProbe,
+        outcome: "success",
+      });
+      throw new Error("force rollback");
+    }),
+    /force rollback/,
+  );
+  assert.equal((await external.query("SELECT 1 FROM gateway_control_tx_probe WHERE id=$1", [rollbackProbe])).rowCount, 0);
+  assert.equal((await security.listAudit({ resourceId: rollbackProbe })).length, 0);
+
+  const commitProbe = `commit_${suffix}`;
+  const commitAudit = `agaud_commit_${suffix}`;
+  await security.withTransaction(async () => {
+    await external.query("INSERT INTO gateway_control_tx_probe(id) VALUES ($1)", [commitProbe]);
+    await security.appendAudit({
+      id: commitAudit,
+      actor,
+      requestId: `req_commit_${suffix}`,
+      action: "probe.create",
+      resourceType: "probe",
+      resourceId: commitProbe,
+      outcome: "success",
+    });
+  });
+  assert.equal((await external.query("SELECT 1 FROM gateway_control_tx_probe WHERE id=$1", [commitProbe])).rowCount, 1);
+  assert.equal((await security.listAudit({ resourceId: commitProbe })).length, 1);
+
+  await external.query("DELETE FROM gateway_control_tx_probe WHERE id=$1", [commitProbe]);
   await security.pool.query("DELETE FROM gateway_role_bindings WHERE principal_id=$1", [principalId]);
   await security.pool.query("DELETE FROM gateway_control_principals WHERE id=$1", [principalId]);
+  await external.end();
   await security.close();
 });
