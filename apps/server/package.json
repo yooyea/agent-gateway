@@ -1,11 +1,12 @@
 {
   "name": "@agent-gateway/server",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
   "scripts": { "build": "tsc -b" },
   "dependencies": {
+    "@agent-gateway/control-plane-auth": "0.4.0",
     "@agent-gateway/core": "0.2.0",
     "@agent-gateway/credential-crypto": "0.3.0",
     "@agent-gateway/provider-openai-agents": "0.2.0",
