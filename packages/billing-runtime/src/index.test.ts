@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { SessionRecord, SessionStore } from "@agent-gateway/core";
 import type { GatewaySession } from "@agent-gateway/protocol";
+import type {
+  BillingAccountRecord,
+  ReservationRecord,
+  UsageObservationInput,
+} from "@agent-gateway/billing-postgres";
 import {
   BillingSessionStore,
   DataPlaneBilling,
@@ -30,7 +35,7 @@ class MemorySessionStore implements SessionStore {
 }
 
 class FakeBilling implements BillingRuntimeStore {
-  account = {
+  account: BillingAccountRecord | undefined = {
     tenantId: "tenant_1",
     currency: "USD",
     creditLimitMicros: "10000000",
@@ -38,18 +43,24 @@ class FakeBilling implements BillingRuntimeStore {
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
-  reservations = new Map<string, any>();
+  reservations = new Map<string, ReservationRecord>();
   calls: string[] = [];
-  observed: any[] = [];
+  observed: UsageObservationInput[] = [];
 
   async getAccount(tenantId: string) {
     this.calls.push(`account:${tenantId}`);
     return this.account;
   }
 
-  async reserve(input: any) {
+  async reserve(input: {
+    tenantId: string;
+    projectId?: string;
+    requestRef: string;
+    amountMicros: bigint | string;
+    expiresAt: string;
+  }): Promise<ReservationRecord> {
     this.calls.push(`reserve:${input.requestRef}:${input.amountMicros}`);
-    const reservation = {
+    const reservation: ReservationRecord = {
       id: "agres_1",
       tenantId: input.tenantId,
       projectId: input.projectId,
@@ -69,6 +80,7 @@ class FakeBilling implements BillingRuntimeStore {
   async attachReservation(reservationId: string, sessionId: string) {
     this.calls.push(`attach:${reservationId}:${sessionId}`);
     const reservation = this.reservations.get(reservationId);
+    if (!reservation) throw new Error("missing reservation");
     reservation.sessionId = sessionId;
     return reservation;
   }
@@ -91,13 +103,13 @@ class FakeBilling implements BillingRuntimeStore {
     return { limited: true as const, remainingMicros: BigInt(reservation.amountMicros), reservation };
   }
 
-  async observeUsage(input: any) {
+  async observeUsage(input: UsageObservationInput) {
     this.observed.push(input);
     return { observationId: "agobs_1", events: [], ledger: [] };
   }
 }
 
-function sessionRecord(budget: SessionRecord["budget"] = { max_cost_usd: 2 }) : SessionRecord {
+function sessionRecord(budget: SessionRecord["budget"] = { max_cost_usd: 2 }): SessionRecord {
   const now = new Date().toISOString();
   return {
     id: "agsess_1",
@@ -146,7 +158,7 @@ test("billed tenant without a hard session budget fails before provider work", a
 test("unbilled tenant preserves legacy session behavior", async () => {
   const base = new MemorySessionStore();
   const billing = new FakeBilling();
-  billing.getAccount = async () => undefined;
+  billing.account = undefined;
   const store = new BillingSessionStore(base, billing);
   const record = sessionRecord(undefined);
 
