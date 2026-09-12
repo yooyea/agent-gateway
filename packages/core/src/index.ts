@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   AgentCapability,
   AgentProvider,
@@ -41,6 +41,8 @@ export interface ProviderChannel {
   weight: number;
 }
 
+export type SessionBindingState = "creating" | "bound" | "failed";
+
 export interface SessionRecord {
   id: string;
   tenantId: string;
@@ -48,7 +50,9 @@ export interface SessionRecord {
   virtualKeyId?: string;
   provider: string;
   channelId: string;
-  providerSessionId: string;
+  providerSessionId?: string;
+  state: SessionBindingState;
+  lastError?: string;
   budget?: SessionBudget;
   createdAt: string;
   updatedAt: string;
@@ -62,18 +66,179 @@ export interface SessionStore {
 
 export class InMemorySessionStore implements SessionStore {
   private readonly records = new Map<string, SessionRecord>();
+
   create(record: SessionRecord) {
     if (this.records.has(record.id)) throw new Error(`Session already exists: ${record.id}`);
-    this.records.set(record.id, { ...record });
+    this.records.set(record.id, structuredClone(record));
   }
+
   get(id: string) {
     const record = this.records.get(id);
-    return record ? { ...record } : undefined;
+    return record ? structuredClone(record) : undefined;
   }
+
   update(record: SessionRecord) {
     if (!this.records.has(record.id)) throw new Error(`Unknown session: ${record.id}`);
-    this.records.set(record.id, { ...record });
+    this.records.set(record.id, structuredClone(record));
   }
+}
+
+export interface VirtualKeyIdentity {
+  id: string;
+  tenantId: string;
+  projectId?: string;
+  enabled: boolean;
+  expiresAt?: string;
+}
+
+export interface VirtualKeyLookupStore {
+  findVirtualKeyByHash(keyHash: string): Promise<VirtualKeyIdentity | undefined>;
+}
+
+export interface VirtualKeyRecord extends VirtualKeyIdentity {
+  key: string;
+}
+
+export function hashVirtualKey(secret: string) {
+  return createHash("sha256").update(secret, "utf8").digest("hex");
+}
+
+export interface GatewayAuthenticator {
+  authenticate(authorization?: string): Promise<GatewayRequestContext> | GatewayRequestContext;
+}
+
+function bearerToken(authorization?: string) {
+  const token = authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+  if (!token) throw new Error("Missing bearer token");
+  return token;
+}
+
+export class StoreBackedVirtualKeyAuthenticator implements GatewayAuthenticator {
+  constructor(private readonly store: VirtualKeyLookupStore) {}
+
+  async authenticate(authorization?: string): Promise<GatewayRequestContext> {
+    const token = bearerToken(authorization);
+    const record = await this.store.findVirtualKeyByHash(hashVirtualKey(token));
+    if (!record || !record.enabled) throw new Error("Invalid API key");
+    if (record.expiresAt && new Date(record.expiresAt).getTime() <= Date.now()) {
+      throw new Error("Invalid API key");
+    }
+    return { tenantId: record.tenantId, projectId: record.projectId, virtualKeyId: record.id };
+  }
+}
+
+export class StaticVirtualKeyAuthenticator implements GatewayAuthenticator {
+  private readonly keys: Map<string, VirtualKeyRecord>;
+
+  constructor(records: VirtualKeyRecord[]) {
+    this.keys = new Map(records.map((record) => [record.key, record]));
+  }
+
+  authenticate(authorization?: string): GatewayRequestContext {
+    const token = bearerToken(authorization);
+    const record = this.keys.get(token);
+    if (!record || !record.enabled) throw new Error("Invalid API key");
+    if (record.expiresAt && new Date(record.expiresAt).getTime() <= Date.now()) {
+      throw new Error("Invalid API key");
+    }
+    return { tenantId: record.tenantId, projectId: record.projectId, virtualKeyId: record.id };
+  }
+}
+
+export interface IdempotencyClaimInput {
+  tenantId: string;
+  virtualKeyId: string;
+  scope: string;
+  key: string;
+  requestHash: string;
+  expiresAt: string;
+}
+
+export type IdempotencyClaimResult =
+  | { state: "claimed" }
+  | { state: "replay"; responseStatus: number; responseBody: unknown }
+  | { state: "conflict" }
+  | { state: "in_progress" };
+
+export interface IdempotencyStore {
+  claim(input: IdempotencyClaimInput): Promise<IdempotencyClaimResult>;
+  complete(input: {
+    tenantId: string;
+    virtualKeyId: string;
+    scope: string;
+    key: string;
+    responseStatus: number;
+    responseBody: unknown;
+    expiresAt?: string;
+  }): Promise<void>;
+}
+
+interface MemoryIdempotencyRecord extends IdempotencyClaimInput {
+  state: "pending" | "completed";
+  responseStatus?: number;
+  responseBody?: unknown;
+}
+
+export class InMemoryIdempotencyStore implements IdempotencyStore {
+  private readonly records = new Map<string, MemoryIdempotencyRecord>();
+
+  private compound(input: Pick<IdempotencyClaimInput, "tenantId" | "virtualKeyId" | "scope" | "key">) {
+    return `${input.tenantId}\u0000${input.virtualKeyId}\u0000${input.scope}\u0000${input.key}`;
+  }
+
+  async claim(input: IdempotencyClaimInput): Promise<IdempotencyClaimResult> {
+    const key = this.compound(input);
+    const existing = this.records.get(key);
+    if (existing && new Date(existing.expiresAt).getTime() <= Date.now()) this.records.delete(key);
+    const current = this.records.get(key);
+    if (!current) {
+      this.records.set(key, { ...structuredClone(input), state: "pending" });
+      return { state: "claimed" };
+    }
+    if (current.requestHash !== input.requestHash) return { state: "conflict" };
+    if (current.state === "completed") {
+      return {
+        state: "replay",
+        responseStatus: current.responseStatus ?? 200,
+        responseBody: structuredClone(current.responseBody),
+      };
+    }
+    return { state: "in_progress" };
+  }
+
+  async complete(input: {
+    tenantId: string;
+    virtualKeyId: string;
+    scope: string;
+    key: string;
+    responseStatus: number;
+    responseBody: unknown;
+    expiresAt?: string;
+  }) {
+    const key = this.compound(input);
+    const current = this.records.get(key);
+    if (!current) throw new Error("Idempotency claim not found");
+    current.state = "completed";
+    current.responseStatus = input.responseStatus;
+    current.responseBody = structuredClone(input.responseBody);
+    if (input.expiresAt) current.expiresAt = input.expiresAt;
+  }
+}
+
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, item]) => [key, canonicalize(item)]),
+    );
+  }
+  return value;
+}
+
+export function stableRequestHash(value: unknown) {
+  return createHash("sha256").update(JSON.stringify(canonicalize(value)), "utf8").digest("hex");
 }
 
 export class ProviderRegistry {
@@ -208,7 +373,6 @@ export class AgentGateway {
     hints: RouteHints = {},
   ): Promise<GatewaySession> {
     const channel = await this.select(hints);
-    const providerSession = await channel.provider.createSession(request);
     const now = new Date().toISOString();
     const record: SessionRecord = {
       id: `agsess_${randomUUID().replaceAll("-", "")}`,
@@ -217,65 +381,60 @@ export class AgentGateway {
       virtualKeyId: context.virtualKeyId,
       provider: channel.provider.type,
       channelId: channel.id,
-      providerSessionId: providerSession.providerSessionId,
+      state: "creating",
       budget: hints.budget,
       createdAt: now,
       updatedAt: now,
     };
+
     await this.sessions.create(record);
-    return gatewaySession(record, providerSession);
+
+    try {
+      const providerSession = await channel.provider.createSession(request);
+      record.providerSessionId = providerSession.providerSessionId;
+      record.state = "bound";
+      record.updatedAt = new Date().toISOString();
+      await this.sessions.update(record);
+      return gatewaySession(record, providerSession);
+    } catch (error) {
+      record.state = "failed";
+      record.lastError = error instanceof Error ? error.message : String(error);
+      record.updatedAt = new Date().toISOString();
+      await this.sessions.update(record);
+      throw error;
+    }
   }
 
   private async resolve(id: string, context: GatewayRequestContext) {
     const record = await this.sessions.get(id);
     if (!record || record.tenantId !== context.tenantId) throw new Error(`Session not found: ${id}`);
+    if (record.state !== "bound" || !record.providerSessionId) {
+      throw new Error(`Session is not bound: ${id} (${record.state})`);
+    }
     const channel = this.registry.get(record.channelId);
-    return { record, channel };
+    return { record, channel, providerSessionId: record.providerSessionId };
   }
 
   async getSession(id: string, context: GatewayRequestContext) {
-    const { record, channel } = await this.resolve(id, context);
-    const providerSession = await channel.provider.getSession(record.providerSessionId);
+    const { record, channel, providerSessionId } = await this.resolve(id, context);
+    const providerSession = await channel.provider.getSession(providerSessionId);
     record.updatedAt = new Date().toISOString();
     await this.sessions.update(record);
     return gatewaySession(record, providerSession);
   }
 
   async sendEvents(id: string, request: SessionEventBatch, context: GatewayRequestContext) {
-    const { record, channel } = await this.resolve(id, context);
-    await channel.provider.sendEvents(record.providerSessionId, request);
+    const { record, channel, providerSessionId } = await this.resolve(id, context);
+    await channel.provider.sendEvents(providerSessionId, request);
     record.updatedAt = new Date().toISOString();
     await this.sessions.update(record);
   }
 
   async streamEvents(id: string, context: GatewayRequestContext) {
-    const { record, channel } = await this.resolve(id, context);
+    const { channel, providerSessionId } = await this.resolve(id, context);
     if (!channel.provider.streamEvents) {
       throw new Error(`Provider ${channel.provider.type} does not support event streaming`);
     }
-    return channel.provider.streamEvents(record.providerSessionId);
-  }
-}
-
-export interface VirtualKeyRecord {
-  id: string;
-  key: string;
-  tenantId: string;
-  projectId?: string;
-  enabled?: boolean;
-}
-
-export class StaticVirtualKeyAuthenticator {
-  private readonly keys: Map<string, VirtualKeyRecord>;
-  constructor(records: VirtualKeyRecord[]) {
-    this.keys = new Map(records.map((record) => [record.key, record]));
-  }
-
-  authenticate(authorization?: string): GatewayRequestContext {
-    const token = authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
-    if (!token) throw new Error("Missing bearer token");
-    const record = this.keys.get(token);
-    if (!record || record.enabled === false) throw new Error("Invalid API key");
-    return { tenantId: record.tenantId, projectId: record.projectId, virtualKeyId: record.id };
+    return channel.provider.streamEvents(providerSessionId);
   }
 }

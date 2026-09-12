@@ -10,13 +10,21 @@ The Control Plane uses gateway-native resources under `/api/gateway/*`.
 
 ## 2. Authentication
 
+Data Plane:
+
 ```http
 Authorization: Bearer ag_xxx
 ```
 
-A Virtual Key resolves to Tenant and optional Project context.
+A Virtual Key resolves to Tenant and optional Project context. In the durable path the plaintext key is never stored; authentication hashes the presented secret and looks up the hash.
 
-Production keys must be revocable, expirable and stored hashed at rest.
+Bootstrap Control Plane:
+
+```http
+Authorization: Bearer <AGENT_GATEWAY_ADMIN_TOKEN>
+```
+
+The bootstrap admin token is an implementation bridge, not the final RBAC design.
 
 ## 3. Data Plane
 
@@ -24,6 +32,7 @@ Production keys must be revocable, expirable and stored hashed at rest.
 
 ```http
 POST /agents/sessions
+Idempotency-Key: caller-generated-key
 ```
 
 Body follows the upstream Agents API shape:
@@ -41,7 +50,9 @@ Body follows the upstream Agents API shape:
 }
 ```
 
-The gateway returns provider-native session fields but replaces the native ID with a gateway-owned ID:
+The gateway allocates and persists the `agsess_*` route before making the upstream create call. On success the binding becomes `bound`; on a provider error it becomes `failed`.
+
+Response preserves provider-native session fields but replaces the routing identity:
 
 ```json
 {
@@ -58,6 +69,12 @@ The gateway returns provider-native session fields but replaces the native ID wi
 }
 ```
 
+A completed idempotent replay returns the stored response and header:
+
+```http
+X-Agent-Gateway-Idempotent-Replay: true
+```
+
 The provider-native session ID is not part of the caller routing contract.
 
 ### Retrieve session
@@ -66,7 +83,7 @@ The provider-native session ID is not part of the caller routing contract.
 GET /agents/sessions/{gateway_session_id}
 ```
 
-The gateway resolves the SessionBinding and retrieves state from the pinned Channel.
+The gateway resolves the durable SessionBinding and retrieves state from the pinned Channel.
 
 ### Submit session events
 
@@ -74,19 +91,15 @@ The gateway resolves the SessionBinding and retrieves state from the pinned Chan
 POST /agents/sessions/{gateway_session_id}/events
 ```
 
-Example:
-
 ```json
 {
   "events": [
     {
       "type": "agent.session.input.message",
-      "input": [
-        {
-          "role": "user",
-          "content": [{ "type": "input_text", "text": "Continue." }]
-        }
-      ]
+      "input": [{
+        "role": "user",
+        "content": [{ "type": "input_text", "text": "Continue." }]
+      }]
     }
   ],
   "idempotency_key": "client-generated-key"
@@ -104,39 +117,66 @@ The gateway resolves the binding and streams events from the original Channel.
 
 ## 4. Gateway routing headers
 
-### Explicit provider
-
 ```http
 X-Agent-Gateway-Provider: openai-agents
-```
-
-### Explicit channel
-
-```http
 X-Agent-Gateway-Channel: openai-primary
-```
-
-Channel takes precedence over Provider.
-
-### Required capabilities
-
-```http
 X-Agent-Gateway-Required-Capabilities: sandbox,mcp,streaming
-```
-
-The request must fail rather than silently degrade if no eligible Channel can satisfy the requirement.
-
-### Session cost ceiling
-
-```http
 X-Agent-Gateway-Max-Cost-Usd: 2.00
 ```
 
-The current code records this as SessionBudget metadata. Production budget enforcement requires reservation + metering + hard-stop policy described in `billing.md`.
+Channel takes precedence over Provider. Required capabilities fail closed. The max-cost value is currently persisted as SessionBudget metadata; hard enforcement is implemented with the later reservation/metering layer.
 
-## 5. Control Plane
+Routing hints participate in the session-create idempotency fingerprint. Reusing an idempotency key with a different channel/provider/budget is therefore a conflict.
 
-The target resource surface is:
+## 5. Bootstrap Control Plane implemented now
+
+### Create Tenant
+
+```http
+POST /api/gateway/admin/tenants
+```
+
+```json
+{ "name": "Acme" }
+```
+
+### Create Project
+
+```http
+POST /api/gateway/admin/projects
+```
+
+```json
+{ "tenant_id": "tenant_...", "name": "Production" }
+```
+
+### Create Virtual Key
+
+```http
+POST /api/gateway/admin/virtual-keys
+```
+
+```json
+{
+  "tenant_id": "tenant_...",
+  "project_id": "project_...",
+  "name": "production-ci",
+  "expires_at": "2027-01-01T00:00:00Z"
+}
+```
+
+The response includes `key: "ag_..."` exactly once. Durable storage keeps only `key_hash` and `key_prefix`.
+
+### List runtime Channels
+
+```http
+GET /api/gateway/channels
+Authorization: Bearer ag_xxx
+```
+
+## 6. Target Control Plane
+
+The eventual resource surface remains broader:
 
 ```text
 GET/POST/PATCH /api/gateway/tenants
@@ -152,11 +192,11 @@ GET            /api/gateway/ledger
 GET            /api/gateway/audit
 ```
 
-`GET /api/gateway/channels` is implemented in v0.2 as the first bootstrap management endpoint.
+The `/admin/*` bootstrap routes will be replaced or wrapped by RBAC-aware resource APIs rather than becoming the permanent public contract.
 
-## 6. Error model
+## 7. Error model
 
-Gateway errors use a stable envelope:
+Gateway errors use:
 
 ```json
 {
@@ -169,44 +209,48 @@ Gateway errors use a stable envelope:
 
 Expected HTTP classes:
 
-- `400`: invalid route/policy/capability request
-- `401`: invalid or missing Virtual Key
+- `400`: invalid route/policy/capability/input request
+- `401`: invalid or missing Virtual Key / bootstrap admin token
 - `403`: tenant/project policy forbids the operation
 - `404`: resource not visible in caller Tenant
-- `409`: idempotency/state conflict
+- `409`: idempotency, binding-state, duplicate or ownership conflict
 - `429`: rate/quota/concurrency/budget admission failure
-- `502/503`: upstream provider/channel unavailable
+- `502/503`: upstream provider/channel or control-plane dependency unavailable
 
 Provider-native errors may be retained in trace/audit data, but secret-bearing upstream details must not be leaked blindly to callers.
 
-## 7. Idempotency
+## 8. Idempotency semantics
 
-All production mutations require an idempotency story.
+Session creation uses the HTTP `Idempotency-Key` header.
 
-Session events already carry `idempotency_key` in the upstream-compatible body. Session creation should support a gateway idempotency header in the durable implementation:
-
-```http
-Idempotency-Key: ...
-```
-
-The persisted idempotency record must include Tenant scope and request fingerprint.
-
-## 8. Identifier prefixes
-
-Recommended gateway-owned prefixes:
+Persisted scope:
 
 ```text
-agtn_      Tenant
-agprj_     Project
-agkey_     Virtual Key record (secret value remains ag_...)
-agprov_    Provider configuration
-agch_      Channel
-agsess_    Session
-agexec_    Execution
-agusg_     UsageEvent
-agres_     Reservation
-agled_     LedgerEntry
-agpol_     Policy
+Tenant + VirtualKey + operation + Idempotency-Key
 ```
 
-Identifiers are opaque; clients must not parse business meaning from them beyond recognizing the resource class.
+The record stores a canonical request fingerprint. Outcomes:
+
+- first request: claim pending and execute
+- same key, different fingerprint: `409`
+- same key, same fingerprint while pending: `409` in progress
+- same key after completion: replay original response
+- after TTL expiry: key may be claimed again
+
+Pending defaults to 900 seconds; completed response replay defaults to 86400 seconds and both are configurable.
+
+Session input/tool events continue to use the upstream-compatible body field `idempotency_key`.
+
+## 9. Identifier prefixes
+
+Current code uses:
+
+```text
+tenant_    Tenant
+project_   Project
+vk_        Virtual Key record
+ag_        Virtual Key secret
+agsess_    Session
+```
+
+Future resource prefixes may become more compact or globally standardized, but identifiers remain opaque to clients.

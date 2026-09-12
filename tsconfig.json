@@ -6,6 +6,7 @@
     {"path":"packages/provider-openai-agents"},
     {"path":"packages/provider-mock"},
     {"path":"packages/sdk"},
+    {"path":"packages/storage-postgres"},
     {"path":"apps/server"}
   ]
 }

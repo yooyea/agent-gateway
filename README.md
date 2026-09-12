@@ -67,7 +67,8 @@ A live session cannot be freely moved between credentials or providers without e
 ```text
 apps/server                       Data plane + bootstrap control plane
 packages/protocol                 Provider plugin contract and shared types
-packages/core                     Routing, session affinity, auth abstractions
+packages/core                     Routing, session affinity, auth + idempotency contracts
+packages/storage-postgres         Durable SaaS identity/session/idempotency store
 packages/provider-openai-agents   OpenAI Agents API adapter
 packages/provider-mock            Local/test provider
 packages/sdk                      Optional TypeScript client
@@ -76,40 +77,49 @@ docs/architecture.md              System architecture
 docs/ontology.md                  Domain ontology and invariants
 docs/api-spec.md                  Northbound and management API contract
 docs/billing.md                   Metering, reservation and settlement model
+docs/persistence.md               Postgres schema and durability semantics
 docs/provider-plugin.md           Provider/channel plugin contract
 ```
 
 ## Current implementation
 
-`v0.2` establishes the correct foundation:
+`v0.2` now contains the first durable SaaS foundation:
 
 - OpenAI Agents API-shaped data plane: `/agents/sessions`
-- virtual-key authentication with tenant/project context
-- stable gateway session IDs (`agsess_*`)
-- provider/channel separation
-- session affinity: every session remains pinned to its selected channel
-- capability-aware channel routing
-- channel priority/weight metadata
+- Postgres-backed Tenant / Project / Virtual Key persistence
+- Virtual Key secrets hashed with SHA-256 at rest; plaintext is returned only at creation time
+- Postgres-backed Session Directory with gateway-owned stable `agsess_*` IDs
+- Session binding lifecycle: `creating -> bound | failed`
+- strict session affinity to the originally selected Channel
+- persisted `Idempotency-Key` handling for session creation with request fingerprints and replay
+- provider/channel separation and capability-aware routing
 - OpenAI Agents API adapter
 - event submission and event streaming
-- provider-native session fields preserved while the public session ID is rewritten
 - provider plugin architecture
+- in-memory persistence remains available for lightweight local development when `DATABASE_URL` is absent
 
-The current in-memory session store and environment-backed virtual-key store are bootstrap implementations. Production persistence, billing ledger and admin UI are specified in `docs/` and are the next implementation layers.
+Billing ledger, Redis operational state, hard budget enforcement and RBAC remain subsequent implementation layers.
 
-## Quick start
+## Quick start with Postgres
 
 ```bash
 cp .env.example .env
-npm install
-npm run build
-npm start
+docker compose up --build
 ```
 
-Development virtual key when `AGENT_GATEWAY_KEYS` is not configured:
+The compose stack starts Postgres, runs schema bootstrap in development, and creates:
 
 ```text
-ag_dev_local
+Virtual Key:  ag_dev_local
+Admin Token:  admin_dev_local
+Tenant:       tenant_dev
+Project:      project_dev
+```
+
+Health:
+
+```bash
+curl http://localhost:8787/health
 ```
 
 Create a session:
@@ -117,12 +127,19 @@ Create a session:
 ```bash
 curl -X POST http://localhost:8787/agents/sessions \
   -H 'authorization: Bearer ag_dev_local' \
+  -H 'idempotency-key: demo-create-1' \
   -H 'content-type: application/json' \
   -d '{
     "agent": {"model":"gpt-6-astra","instructions":"Inspect the repository and fix the task."},
     "environment": {"type":"none"},
     "input":"Find the highest-impact issue and fix it."
   }'
+```
+
+Retrying the same request with the same `Idempotency-Key` returns the original gateway session and adds:
+
+```text
+x-agent-gateway-idempotent-replay: true
 ```
 
 Force a provider or channel without changing the Agents API request body:
@@ -140,6 +157,40 @@ curl http://localhost:8787/api/gateway/channels \
   -H 'authorization: Bearer ag_dev_local'
 ```
 
+## Bootstrap Control Plane
+
+Create a tenant:
+
+```bash
+curl -X POST http://localhost:8787/api/gateway/admin/tenants \
+  -H 'authorization: Bearer admin_dev_local' \
+  -H 'content-type: application/json' \
+  -d '{"name":"Acme"}'
+```
+
+Create a project, then create a virtual key with the returned tenant/project IDs:
+
+```text
+POST /api/gateway/admin/projects
+POST /api/gateway/admin/virtual-keys
+```
+
+A generated Virtual Key secret is returned once. Only its hash and display prefix are persisted.
+
+## Local process without Postgres
+
+For a minimal development process:
+
+```bash
+cp .env.example .env
+unset DATABASE_URL
+npm install
+npm run build
+npm start
+```
+
+This uses the in-memory Session/Idempotency stores and `AGENT_GATEWAY_KEYS`.
+
 ## Design rule: compatibility outside, governance inside
 
 The data plane follows the upstream Agents API shape as closely as practical. Gateway-specific routing and policy are carried through headers so ordinary clients do not need a gateway-specific request schema.
@@ -150,14 +201,14 @@ The control plane is separate under `/api/gateway/*` and owns tenants, projects,
 
 The implementation order is intentionally infrastructure-first:
 
-1. durable Postgres session directory and idempotency
-2. Redis-backed concurrency/rate limiting
-3. virtual-key/project/tenant persistence and RBAC
-4. usage meter + immutable ledger
+1. Redis-backed concurrency/rate limiting and hot session cache
+2. persistent provider/channel configuration and encrypted credential storage
+3. RBAC + operator audit for the Control Plane
+4. usage meter + immutable billing ledger
 5. session budget reservation and hard-stop policy
 6. provider cost reconciliation
 7. channel health, circuit breaking and failover policy
-8. admin/dashboard APIs
+8. full admin/dashboard APIs
 9. additional provider adapters
 10. explicit cross-provider migration instead of pretending sessions are stateless
 

@@ -44,42 +44,31 @@ Provider: openai-agents
   |- Channel: enterprise-openai-project-x
 ```
 
-A Channel owns or references:
+A Channel owns or references credentials, endpoint/account identity, priority/weight, health, capacity constraints and cost metadata.
 
-- credentials
-- base endpoint
-- account/project identity
-- priority / weight
-- health
-- capacity/rate constraints
-- cost/pricing metadata
-
-This separation is required for real gateway behavior.
-
-## 3. Session affinity
+## 3. Session affinity and durable binding
 
 A new request follows:
 
 ```text
 Create Session
    |
-   v
-Authenticate Virtual Key
+Authenticate Virtual Key -> Tenant / Project
    |
-   v
-Resolve Tenant/Project Policy
+Resolve policy and select eligible Channel
    |
-   v
-Select eligible Channel
+Allocate gateway agsess_...
    |
-   v
+Persist SessionBinding(state=creating, selected Channel)
+   |
 Create provider-native session
+   |                         |
+ success                    failure
+   |                         |
+Persist provider ID       Persist state=failed
+state=bound               + last error
    |
-   v
-Persist Session Binding
-   |
-   v
-Return gateway-owned agsess_...
+Return agsess_...
 ```
 
 The binding is conceptually:
@@ -90,6 +79,7 @@ agsess_123
   -> provider=openai-agents
   -> channel=openai-account-a
   -> provider_session_id=session_xyz
+  -> state=bound
 ```
 
 Every later operation resolves the binding first:
@@ -117,19 +107,20 @@ Selection pipeline:
 9. weighted selection inside the tier
 10. optional cost/latency/reliability scoring
 
-The current implementation establishes capability filtering plus priority/weight metadata. Production routing should move policy and health state into durable services.
+The current implementation establishes capability filtering plus priority/weight metadata. Production routing policy and channel health will later move into durable + Redis-backed services.
 
 ## 5. Data Plane
 
 Responsibilities:
 
-- authenticate virtual keys
-- derive tenant/project context
+- authenticate hashed Virtual Keys
+- derive Tenant/Project context
 - enforce policy
 - create gateway session IDs
-- resolve session bindings
+- resolve durable Session Bindings
 - proxy/map events
 - stream events
+- persist idempotency decisions
 - emit usage/trace records
 - enforce active budget/concurrency decisions
 
@@ -149,18 +140,24 @@ Responsibilities:
 - usage reconciliation
 - audit and operator workflows
 
+The bootstrap implementation exposes admin-token protected create endpoints for Tenant, Project and Virtual Key. Full RBAC replaces the bootstrap admin token later.
+
 ## 7. Persistence
 
 ### Postgres
 
-Source of truth for:
+Implemented source of truth now:
 
-- tenants/users/projects
-- virtual keys (hashed secret material)
-- providers/channels
-- session bindings
+- tenants/projects
+- virtual keys (hashed secret + prefix)
+- session bindings and binding lifecycle
+- idempotency records and replay response
+
+Planned Postgres source of truth:
+
+- users/RBAC
+- providers/channels/credential references
 - routing decisions
-- idempotency records
 - usage events
 - price snapshots
 - reservations
@@ -169,7 +166,7 @@ Source of truth for:
 
 ### Redis
 
-Operational state for:
+Planned operational state for:
 
 - rate limits
 - concurrency leases
@@ -177,9 +174,17 @@ Operational state for:
 - channel health/circuit breaker
 - short-lived idempotency acceleration
 
-Redis is not the financial source of truth.
+Redis is never the financial or session-affinity source of truth.
 
-## 8. Billing pipeline
+## 8. Idempotency
+
+Session creation uses `Idempotency-Key` scoped by Tenant + Virtual Key + operation. The request fingerprint includes the data-plane body and routing hints.
+
+A completed request replays the original response. A reused key with a different fingerprint fails. A concurrent request for a pending key fails as in-progress rather than creating a second upstream session.
+
+Session-event idempotency remains compatible with the provider body field `idempotency_key`.
+
+## 9. Billing pipeline
 
 ```text
 Provider/runtime events
@@ -205,24 +210,28 @@ Immutable Ledger
 
 Provider session `usage` is evidence, not the ledger itself.
 
-## 9. Reliability
+## 10. Reliability
 
 For new sessions, unhealthy channels can be skipped or circuit-broken.
 
-For an existing session, channel failure must not cause transparent rerouting to another provider because the provider-native session state would be lost. The gateway should instead expose a failed/degraded state and optionally offer an explicit migration/recovery operation.
+For an existing session, channel failure must not cause transparent rerouting to another provider because provider-native session state would be lost. The gateway exposes the failed/degraded state and may later offer explicit migration/recovery.
 
-## 10. Security
+The durable `creating/bound/failed` binding state makes partially completed creation observable instead of silently losing the selected route.
+
+## 11. Security
 
 - upstream provider credentials never reach callers
-- virtual-key secrets are hashed at rest in production
-- all data-plane access resolves a tenant context
-- session IDs are tenant-isolated
+- durable Virtual Key secrets are SHA-256 hashed at rest
+- plaintext Virtual Key is returned only once at creation
+- all data-plane access resolves a Tenant context
+- session IDs are Tenant-isolated
 - credential access belongs to a narrow provider execution boundary
 - logs must redact bearer tokens and provider secrets
 - financial/admin operations require RBAC and audit entries
+- development bootstrap credentials are forbidden as a production mechanism
 
-## 11. Extensibility
+## 12. Extensibility
 
-Provider packages implement a small adapter interface. The core knows channels and capabilities, not vendor SDKs.
+Provider packages implement a small adapter interface. The core knows Channels and capabilities, not vendor SDKs.
 
 A provider may expose native fields in its session payload. The gateway rewrites the public session ID and appends `gateway.provider/channel` metadata instead of flattening every provider into a lowest-common-denominator object.

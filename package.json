@@ -7,11 +7,13 @@
   "scripts": {
     "build": "tsc -b",
     "check": "tsc -b --pretty false",
+    "test": "npm run build && node --test packages/core/dist/index.test.js",
     "dev": "npm run build && node apps/server/dist/index.js",
     "start": "node apps/server/dist/index.js"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
+    "@types/pg": "^8.15.5",
     "typescript": "^5.8.3"
   },
   "engines": { "node": ">=22" }
