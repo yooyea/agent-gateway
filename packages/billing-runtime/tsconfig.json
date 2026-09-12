@@ -11,6 +11,7 @@
     "skipLibCheck": true
   },
   "references": [
+    {"path":"../protocol"},
     {"path":"../core"},
     {"path":"../billing-postgres"}
   ],
