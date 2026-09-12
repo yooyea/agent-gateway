@@ -1,18 +1,44 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-09-12
 
-### Redis runtime controls
+### Runtime controls
 
-- Added `@agent-gateway/runtime-redis` for operational hot-path state.
-- Added fixed-window request rate limiting per Virtual Key using atomic Redis Lua operations.
-- Added concurrency leases with ZSET expiry, explicit release and heartbeat renewal for long-running streams/tasks.
+- Added `@agent-gateway/runtime-redis` for reconstructable hot-path state.
+- Added fixed-window request rate limiting per Virtual Key using atomic Redis operations.
+- Added concurrency leases with expiry, explicit release and heartbeat renewal for long-running streams/tasks.
 - Added read-through/write-through Session cache while preserving Postgres as the durable source of truth.
 - Added Channel circuit-breaker failure windows and open TTLs.
-- Open circuits affect only new Session routing; existing Session Bindings remain pinned to their original Channel.
+- Open circuits affect only new Session routing; existing SessionBindings remain pinned to their original Channel.
 - Added `429` admission responses with `Retry-After` and limit-type metadata.
-- Added Redis to Docker Compose and GitHub Actions integration tests.
-- Added a core regression test covering circuit-breaker routing without violating Session Affinity.
+
+### Persistent runtime supply
+
+- Added durable `Provider`, `Credential`, and `Channel` resources in Postgres.
+- Persistent Channel configuration is now the runtime source of truth when Postgres is enabled.
+- Added trusted Provider type -> installed plugin mapping; database rows cannot import arbitrary modules.
+- Added live runtime-registry rebuild after Provider, Credential, and Channel mutations.
+- Disabled Channels remain resolvable for existing bound Sessions while being excluded from new-session routing.
+- Added database constraints preventing a Channel from referencing a Credential owned by a different Provider.
+
+### Credential security
+
+- Added `@agent-gateway/credential-crypto`.
+- Added AES-256-GCM authenticated encryption for upstream Credential payloads.
+- Bound ciphertext to Credential + Provider identity through authenticated data.
+- Master encryption keys stay outside Postgres and support multiple decrypt keys plus one active encryption key.
+- Added Credential master-key rewrap without changing the upstream provider secret.
+- Added upstream secret replacement through the Credential resource.
+- Redacted encrypted payloads from Control Plane list responses.
+- Provider/Channel plaintext config rejects secret-like field names.
+- Development OpenAI bootstrap now persists `OPENAI_API_KEY` as an encrypted Credential rather than plaintext Channel config.
+
+### Validation
+
+- CI runs real Postgres 17 and Redis 7 services.
+- Added Credential encryption/rotation tests.
+- Extended Postgres integration coverage for Provider/Credential/Channel persistence, redaction, ownership constraints, Session bindings, and idempotency.
+- Added core regression coverage for circuit breaking without violating Session Affinity.
 
 ## 0.2.0 - 2026-09-12
 

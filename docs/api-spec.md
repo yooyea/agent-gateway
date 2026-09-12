@@ -4,7 +4,7 @@
 
 The Data Plane should look like an Agents API, not like a proprietary gateway protocol.
 
-The first compatibility target is the OpenAI Agents API session surface. Gateway-specific selection and policy are expressed through headers so standard request bodies remain portable.
+The first compatibility target is the OpenAI Agents API Session surface. Gateway-specific selection and policy are expressed through headers so standard request bodies remain portable.
 
 The Control Plane uses gateway-native resources under `/api/gateway/*`.
 
@@ -16,7 +16,7 @@ Data Plane:
 Authorization: Bearer ag_xxx
 ```
 
-A Virtual Key resolves to Tenant and optional Project context. In the durable path the plaintext key is never stored; authentication hashes the presented secret and looks up the hash.
+A Virtual Key resolves to Tenant and optional Project context. In the durable path plaintext is never stored; authentication hashes the presented secret and looks up the hash.
 
 Bootstrap Control Plane:
 
@@ -28,7 +28,7 @@ The bootstrap admin token is an implementation bridge, not the final RBAC design
 
 ## 3. Data Plane
 
-### Create session
+### Create Session
 
 ```http
 POST /agents/sessions
@@ -40,7 +40,6 @@ Body follows the upstream Agents API shape:
 ```json
 {
   "agent": {
-    "model": "gpt-6-astra",
     "instructions": "Inspect the repository and implement the task."
   },
   "environment": { "type": "none" },
@@ -50,17 +49,15 @@ Body follows the upstream Agents API shape:
 }
 ```
 
-The gateway allocates and persists the `agsess_*` route before making the upstream create call. On success the binding becomes `bound`; on a provider error it becomes `failed`.
+The gateway allocates and persists the `agsess_*` route before making the upstream create call. On success the binding becomes `bound`; on provider error it becomes `failed`.
 
-Response preserves provider-native session fields but replaces the routing identity:
+Response preserves provider-native fields but replaces the routing identity:
 
 ```json
 {
   "id": "agsess_...",
   "object": "agent.session",
   "status": "idle",
-  "agent": {},
-  "environment": {},
   "usage": {},
   "gateway": {
     "provider": "openai-agents",
@@ -75,9 +72,7 @@ A completed idempotent replay returns the stored response and header:
 X-Agent-Gateway-Idempotent-Replay: true
 ```
 
-The provider-native session ID is not part of the caller routing contract.
-
-### Retrieve session
+### Retrieve Session
 
 ```http
 GET /agents/sessions/{gateway_session_id}
@@ -85,7 +80,7 @@ GET /agents/sessions/{gateway_session_id}
 
 The gateway resolves the durable SessionBinding and retrieves state from the pinned Channel.
 
-### Submit session events
+### Submit Session events
 
 ```http
 POST /agents/sessions/{gateway_session_id}/events
@@ -93,27 +88,25 @@ POST /agents/sessions/{gateway_session_id}/events
 
 ```json
 {
-  "events": [
-    {
-      "type": "agent.session.input.message",
-      "input": [{
-        "role": "user",
-        "content": [{ "type": "input_text", "text": "Continue." }]
-      }]
-    }
-  ],
+  "events": [{
+    "type": "agent.session.input.message",
+    "input": [{
+      "role": "user",
+      "content": [{ "type": "input_text", "text": "Continue." }]
+    }]
+  }],
   "idempotency_key": "client-generated-key"
 }
 ```
 
-### Stream session events
+### Stream Session events
 
 ```http
 GET /agents/sessions/{gateway_session_id}/events
 Accept: text/event-stream
 ```
 
-The gateway resolves the binding and streams events from the original Channel.
+The gateway streams events from the original bound Channel.
 
 ## 4. Gateway routing headers
 
@@ -124,65 +117,134 @@ X-Agent-Gateway-Required-Capabilities: sandbox,mcp,streaming
 X-Agent-Gateway-Max-Cost-Usd: 2.00
 ```
 
-Channel takes precedence over Provider. Required capabilities fail closed. The max-cost value is currently persisted as SessionBudget metadata; hard enforcement is implemented with the later reservation/metering layer.
+Channel takes precedence over Provider. Required capabilities fail closed. Max cost is currently persisted as SessionBudget metadata; hard enforcement belongs to the reservation/metering layer.
 
-Routing hints participate in the session-create idempotency fingerprint. Reusing an idempotency key with a different channel/provider/budget is therefore a conflict.
+Routing hints participate in the Session-create idempotency fingerprint.
 
-## 5. Bootstrap Control Plane implemented now
+## 5. Bootstrap Control Plane
 
-### Create Tenant
+### Tenant / Project / Virtual Key
 
-```http
+```text
 POST /api/gateway/admin/tenants
-```
-
-```json
-{ "name": "Acme" }
-```
-
-### Create Project
-
-```http
 POST /api/gateway/admin/projects
-```
-
-```json
-{ "tenant_id": "tenant_...", "name": "Production" }
-```
-
-### Create Virtual Key
-
-```http
 POST /api/gateway/admin/virtual-keys
 ```
 
+Virtual Key creation returns `key: "ag_..."` exactly once. Durable storage keeps only the key hash and display prefix.
+
+### Providers
+
+```text
+GET   /api/gateway/admin/providers
+POST  /api/gateway/admin/providers
+PATCH /api/gateway/admin/providers/{provider_id}
+```
+
+Create example:
+
 ```json
 {
-  "tenant_id": "tenant_...",
-  "project_id": "project_...",
-  "name": "production-ci",
-  "expires_at": "2027-01-01T00:00:00Z"
+  "type": "openai-agents",
+  "display_name": "OpenAI Agents API",
+  "enabled": true,
+  "config": {}
 }
 ```
 
-The response includes `key: "ag_..."` exactly once. Durable storage keeps only `key_hash` and `key_prefix`.
+`type` must exist in the trusted server-side Provider plugin catalog. Database/API input cannot supply an arbitrary module path.
 
-### List runtime Channels
+Provider config is non-secret. Secret-like fields are rejected.
+
+### Credentials
+
+```text
+GET   /api/gateway/admin/credentials
+POST  /api/gateway/admin/credentials
+PATCH /api/gateway/admin/credentials/{credential_id}
+POST  /api/gateway/admin/credentials/{credential_id}/rewrap
+```
+
+Create example:
+
+```json
+{
+  "provider_id": "agprov_...",
+  "name": "production-openai",
+  "kind": "api_key",
+  "payload": {
+    "apiKey": "sk-..."
+  }
+}
+```
+
+The request payload is encrypted before durable storage. Control Plane responses return Credential metadata only and never return plaintext or ciphertext.
+
+`PATCH` replaces the upstream secret payload and encrypts it with the currently active master key.
+
+`POST .../rewrap` keeps the provider secret unchanged but decrypts/re-encrypts the Credential with the current active master key.
+
+### Channels
+
+```text
+GET   /api/gateway/admin/channels
+POST  /api/gateway/admin/channels
+PATCH /api/gateway/admin/channels/{channel_id}
+```
+
+Create example:
+
+```json
+{
+  "provider_id": "agprov_...",
+  "credential_id": "agcred_...",
+  "name": "openai-primary",
+  "enabled": true,
+  "priority": 100,
+  "weight": 100,
+  "config": {
+    "baseUrl": "https://api.openai.com/v1",
+    "defaultModel": "gpt-6-astra"
+  }
+}
+```
+
+A Channel may reference only a Credential owned by the same Provider.
+
+Provider/Channel mutations and Credential secret replacement rebuild the in-process runtime registry. Stable Channel IDs preserve existing SessionBinding resolution.
+
+### Runtime Channel view
 
 ```http
 GET /api/gateway/channels
 Authorization: Bearer ag_xxx
 ```
 
-## 6. Target Control Plane
+The data-plane-authenticated view reports runtime health/circuit information without exposing Credential material.
 
-The eventual resource surface remains broader:
+## 6. Credential encryption configuration
+
+The runtime keyring is supplied outside the API:
+
+```text
+AGENT_GATEWAY_CREDENTIAL_KEYS
+AGENT_GATEWAY_ACTIVE_CREDENTIAL_KEY_ID
+```
+
+Each configured key must decode from base64 to exactly 32 bytes. Multiple keys may be retained for decryption during rotation; only the active key encrypts new/rewrapped records.
+
+See `docs/credentials.md` for the rotation procedure.
+
+## 7. Target Control Plane
+
+The long-term RBAC-aware resource surface remains broader:
 
 ```text
 GET/POST/PATCH /api/gateway/tenants
 GET/POST/PATCH /api/gateway/projects
 GET/POST/PATCH /api/gateway/keys
 GET/POST/PATCH /api/gateway/providers
+GET/POST/PATCH /api/gateway/credentials
 GET/POST/PATCH /api/gateway/channels
 GET/POST/PATCH /api/gateway/policies
 GET            /api/gateway/sessions
@@ -192,9 +254,9 @@ GET            /api/gateway/ledger
 GET            /api/gateway/audit
 ```
 
-The `/admin/*` bootstrap routes will be replaced or wrapped by RBAC-aware resource APIs rather than becoming the permanent public contract.
+The current `/admin/*` bootstrap routes will be replaced or wrapped by RBAC-aware APIs rather than becoming the permanent public contract.
 
-## 7. Error model
+## 8. Error model
 
 Gateway errors use:
 
@@ -209,27 +271,25 @@ Gateway errors use:
 
 Expected HTTP classes:
 
-- `400`: invalid route/policy/capability/input request
-- `401`: invalid or missing Virtual Key / bootstrap admin token
-- `403`: tenant/project policy forbids the operation
-- `404`: resource not visible in caller Tenant
-- `409`: idempotency, binding-state, duplicate or ownership conflict
+- `400`: invalid route/policy/capability/input, unknown Provider type, or plaintext secret config
+- `401`: invalid/missing Virtual Key or bootstrap admin token
+- `403`: policy forbids operation
+- `404`: Session/Provider/Credential/Channel not found
+- `409`: idempotency, binding-state, duplicate, FK/ownership or state conflict
 - `429`: rate/quota/concurrency/budget admission failure
-- `502/503`: upstream provider/channel or control-plane dependency unavailable
+- `502/503`: upstream Provider/Channel or required control-plane dependency unavailable
 
-Provider-native errors may be retained in trace/audit data, but secret-bearing upstream details must not be leaked blindly to callers.
+Provider-native errors may be retained in protected traces/audit data, but secret-bearing upstream details must not be leaked blindly to callers.
 
-## 8. Idempotency semantics
+## 9. Idempotency semantics
 
-Session creation uses the HTTP `Idempotency-Key` header.
-
-Persisted scope:
+Session creation uses `Idempotency-Key` scoped by:
 
 ```text
 Tenant + VirtualKey + operation + Idempotency-Key
 ```
 
-The record stores a canonical request fingerprint. Outcomes:
+Outcomes:
 
 - first request: claim pending and execute
 - same key, different fingerprint: `409`
@@ -237,20 +297,21 @@ The record stores a canonical request fingerprint. Outcomes:
 - same key after completion: replay original response
 - after TTL expiry: key may be claimed again
 
-Pending defaults to 900 seconds; completed response replay defaults to 86400 seconds and both are configurable.
-
 Session input/tool events continue to use the upstream-compatible body field `idempotency_key`.
 
-## 9. Identifier prefixes
+## 10. Identifier prefixes
 
-Current code uses:
+Current/new resource patterns include:
 
 ```text
-tenant_    Tenant
-project_   Project
-vk_        Virtual Key record
-ag_        Virtual Key secret
-agsess_    Session
+tenant_     Tenant
+project_    Project
+vk_         Virtual Key record
+ag_         Virtual Key secret
+agprov_     Provider
+agcred_     Credential
+agch_       Channel
+agsess_     Session
 ```
 
-Future resource prefixes may become more compact or globally standardized, but identifiers remain opaque to clients.
+Identifiers are opaque to clients.

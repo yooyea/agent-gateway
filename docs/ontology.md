@@ -22,9 +22,7 @@ A namespace inside a Tenant. Sessions and Virtual Keys may be scoped to a Projec
 
 ### VirtualKey
 
-A caller credential issued by the gateway.
-
-A VirtualKey resolves to exactly one Tenant and may resolve to one Project.
+A caller credential issued by the gateway. A VirtualKey resolves to exactly one Tenant and may resolve to one Project.
 
 ## 2. Runtime supply domain
 
@@ -34,21 +32,29 @@ A type of upstream agent runtime implementation.
 
 Examples: `openai-agents`, future `claude-agent`, future self-hosted harness adapters.
 
-Provider is semantic/technical identity, not a credential.
+Provider is semantic/technical adapter identity. It is not a routable account and does not contain provider secrets.
+
+### Credential
+
+Encrypted secret material used to authenticate or authorize calls to one Provider.
+
+A Credential belongs to exactly one Provider. It may contain API keys, tokens or other provider-native authentication fields. Its plaintext payload exists only inside the narrow provider execution boundary.
+
+Credential encryption metadata is durable; master decryption keys are external runtime secrets and are not ontology-owned database records.
 
 ### Channel
 
-A routable provider instance/configuration.
+A routable Provider instance/configuration.
 
-A Channel belongs to exactly one Provider and carries endpoint/credential/capacity/policy metadata.
+A Channel belongs to exactly one Provider and may reference one Credential belonging to that same Provider. It carries non-secret endpoint/configuration metadata, priority/weight and enabled state.
 
-A Provider may have zero or many Channels.
+A Provider may have zero or many Channels. A Credential may be reused by multiple Channels of the same Provider.
 
 ### Capability
 
 A runtime feature such as sandbox, streaming, MCP, tools, artifacts or subagents.
 
-A Channel inherits provider capabilities and may further constrain them.
+A Channel inherits Provider capabilities and may further constrain them.
 
 ## 3. Runtime demand domain
 
@@ -56,9 +62,7 @@ A Channel inherits provider capabilities and may further constrain them.
 
 Gateway-owned durable conversation/execution identity.
 
-A Session belongs to exactly one Tenant and may belong to one Project.
-
-Its external identity is gateway-owned (`agsess_*`).
+A Session belongs to exactly one Tenant and may belong to one Project. Its external identity is gateway-owned (`agsess_*`).
 
 ### SessionBinding
 
@@ -70,11 +74,13 @@ Session -> Provider -> Channel -> ProviderSessionId
 
 Normal session traffic never replaces this binding.
 
+A Channel becoming disabled, unhealthy or open-circuit does not rewrite an existing SessionBinding.
+
 ### Execution
 
 A bounded period of work inside a Session. A Session may contain many Executions/turns.
 
-Execution is the natural unit for latency, iteration and tool-level traces even when a provider only exposes aggregate session usage.
+Execution is the natural unit for latency, iteration and tool-level traces even when a provider only exposes aggregate Session usage.
 
 ### Event
 
@@ -128,9 +134,7 @@ What the gateway owes an upstream provider for measured usage.
 
 ### Charge
 
-What a customer owes the gateway.
-
-Cost and Charge are not required to be equal.
+What a customer owes the gateway. Cost and Charge are not required to be equal.
 
 ### Reservation
 
@@ -156,7 +160,7 @@ Correlates requests, executions, provider calls, tools and usage.
 
 ### AuditEvent
 
-Records security/administrative mutations such as key creation, channel credential changes, price changes or manual balance adjustments.
+Records security/administrative mutations such as key creation, Channel/Credential changes, price changes or manual balance adjustments.
 
 ## 7. Critical relations
 
@@ -166,6 +170,8 @@ Tenant 1 --- N VirtualKey
 Tenant 1 --- N Session
 Project 1 --- N Session
 Provider 1 --- N Channel
+Provider 1 --- N Credential
+Channel N --- 0..1 Credential (same Provider only)
 Session 1 --- 1 SessionBinding
 Session 1 --- N Execution
 Session 1 --- N UsageEvent
@@ -181,11 +187,14 @@ UsageEvent N --- 1..N LedgerEntry (through settlement/adjustment)
 2. A Session cannot be read or mutated from another Tenant context.
 3. Public Session ID never equals the provider-native session ID by architectural requirement.
 4. A SessionBinding is created once for normal execution and is not silently replaced.
-5. A Channel belongs to one Provider.
-6. Provider credentials belong to Channels/control-plane secret storage, never callers.
-7. Routing is evaluated for new Sessions, not every event of an existing Session.
-8. UsageEvent is append-only evidence; LedgerEntry is immutable financial truth.
-9. Reconciliation appends adjustments instead of rewriting historical ledger entries.
-10. Price changes affect future settlement according to effective-time semantics; they do not rewrite past invoices.
-11. Budget enforcement may reject new work even when the last settled charge is below the budget because outstanding Reservations count against available capacity.
-12. Cross-provider session movement is represented as explicit migration/lineage, never hidden rerouting.
+5. A Channel belongs to exactly one Provider.
+6. A Credential belongs to exactly one Provider, and a Channel may reference only a Credential owned by that same Provider.
+7. Provider/Channel plaintext configuration contains no credential material; provider secrets are represented as Credential payloads.
+8. Credential master encryption keys are external runtime secrets, never database records or API resources.
+9. Routing is evaluated for new Sessions, not every event of an existing Session.
+10. Disabling/open-circuiting a Channel affects new routing but never silently moves a bound Session.
+11. UsageEvent is append-only evidence; LedgerEntry is immutable financial truth.
+12. Reconciliation appends adjustments instead of rewriting historical ledger entries.
+13. Price changes affect future settlement according to effective-time semantics; they do not rewrite past invoices.
+14. Budget enforcement may reject new work even when the last settled charge is below the budget because outstanding Reservations count against available capacity.
+15. Cross-provider or cross-Channel session movement is represented as explicit migration/lineage, never hidden rerouting.

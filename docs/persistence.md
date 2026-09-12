@@ -2,9 +2,9 @@
 
 ## Purpose
 
-Postgres is the durable source of truth for identity and session routing. Redis may later accelerate hot-path reads, but a Redis loss must not destroy tenant ownership, session affinity or financial truth.
+Postgres is the durable source of truth for identity, runtime supply configuration and Session routing. Redis accelerates operational hot paths but a Redis loss must not destroy tenant ownership, Channel configuration, Session Affinity or financial truth.
 
-The first durable implementation lives in `@agent-gateway/storage-postgres`.
+The durable implementation lives in `@agent-gateway/storage-postgres`.
 
 ## Durable resources implemented now
 
@@ -12,11 +12,14 @@ The first durable implementation lives in `@agent-gateway/storage-postgres`.
 gateway_tenants
 gateway_projects
 gateway_virtual_keys
+gateway_providers
+gateway_credentials
+gateway_channels
 gateway_sessions
 gateway_idempotency
 ```
 
-Future billing/provider resources will extend this schema rather than replacing its ownership boundaries.
+Future RBAC, usage, pricing, reservation, ledger and audit resources extend these ownership boundaries rather than replacing them.
 
 ## Virtual Key storage
 
@@ -27,22 +30,29 @@ secret shown to caller:  ag_...
 record id:               vk_...
 ```
 
-The durable table stores:
+The durable table stores Tenant/Project ownership, SHA-256 secret hash, short display prefix, enabled state and optional expiry. Plaintext is returned only when a key is created and is not recoverable from Postgres.
 
-- key record ID
-- Tenant / optional Project ownership
-- SHA-256 hash of the secret
-- short display prefix
-- enabled state
-- optional expiry
+## Provider / Credential / Channel storage
 
-The plaintext secret is returned only when a key is created and must not be recoverable from the database.
+`gateway_providers` stores Provider type, display metadata, enabled state and non-secret config.
 
-Authentication hashes the presented bearer token and performs an indexed lookup. Tenant and Project must both be active.
+`gateway_credentials` stores Provider ownership, secret kind/name, encrypted payload, encryption-key id and algorithm. The encrypted payload is internal storage data and is redacted from normal Control Plane responses.
+
+`gateway_channels` stores Provider ownership, optional Credential reference, non-secret config, enabled state, priority and weight.
+
+The database enforces:
+
+```text
+Channel.provider_id == Credential.provider_id
+```
+
+for every Channel that references a Credential. This prevents accidentally attaching one Provider's secret to another Provider.
+
+Master Credential encryption keys are deliberately outside Postgres. See `credentials.md`.
 
 ## Session Directory lifecycle
 
-A Session Binding is written before the upstream session is created:
+A SessionBinding is written before the upstream Session is created:
 
 ```text
 allocate agsess_...
@@ -50,7 +60,7 @@ select Channel
 persist state=creating + Channel
         |
         v
-create upstream session
+create upstream Session
    |                 |
  success           error
    |                 |
@@ -58,19 +68,36 @@ state=bound       state=failed
 provider_session  last_error
 ```
 
-This preserves the routing decision even if the provider call fails. Once `bound`, all later operations resolve the stored Channel and provider-native session ID. Existing sessions are never silently re-routed.
+This preserves the routing decision even when provider creation fails. Once bound, all later operations resolve the stored Channel and provider-native Session ID.
 
-`provider_session_id` is nullable only while the binding is not yet bound.
+Channel configuration can be reloaded while retaining the same Channel ID. Existing Sessions are never silently re-routed because a Channel is disabled or unhealthy.
+
+## Runtime configuration loading
+
+With Postgres enabled, the server loads runtime Channels from durable records:
+
+```text
+Provider row
++ Channel row
++ encrypted Credential row
+        |
+        v
+trusted Provider plugin lookup
+        |
+Credential decrypt in memory
+        |
+Provider adapter instance
+        |
+Channel registered under stable id
+```
+
+Provider plugin module paths are not stored as untrusted database data. Provider type is mapped through a trusted server-side catalog.
 
 ## Idempotency
 
-Session creation accepts:
+Session creation accepts `Idempotency-Key`.
 
-```http
-Idempotency-Key: caller-generated-value
-```
-
-The durable key scope is:
+Durable scope:
 
 ```text
 Tenant + VirtualKey + operation scope + Idempotency-Key
@@ -81,37 +108,48 @@ The record stores a canonical SHA-256 request fingerprint including gateway rout
 Outcomes:
 
 - first request: claim `pending`
-- same key + same fingerprint while pending: `409 in progress`
-- same key + different fingerprint: `409 conflict`
-- completed request: replay the stored HTTP status/body
+- same key + same fingerprint while pending: conflict/in-progress
+- same key + different fingerprint: conflict
+- completed request: replay stored HTTP status/body
 - expired record: claim may be reused
 
-Pending and completed records use separate TTLs. Pending defaults to 15 minutes; completed replay defaults to 24 hours.
+The gateway keeps failed/ambiguous upstream creation claims pending until pending TTL expiry. Immediately retrying an ambiguous network failure could create duplicate upstream Sessions.
 
-The gateway deliberately keeps a failed/ambiguous upstream creation claim pending until its pending TTL expires. This is conservative: immediately retrying an ambiguous network failure could create two upstream sessions.
+## Redis interaction
+
+Redis stores only reconstructable/lease-based data:
+
+- hot Session cache
+- rate windows
+- concurrency leases
+- circuit state
+
+A cache miss falls back to Postgres. Redis does not store Credential truth, SessionBinding truth or future Ledger truth.
 
 ## Migrations
 
-The current schema bootstrap is idempotent `CREATE TABLE/INDEX IF NOT EXISTS` SQL executed by the storage package.
+Schema bootstrap currently uses idempotent `CREATE TABLE/INDEX IF NOT EXISTS` statements in the storage package.
 
-Development defaults may auto-migrate. Production must make migration ownership explicit; `AGENT_GATEWAY_AUTO_MIGRATE=true` is required if the application process itself owns schema changes.
-
-A versioned migration framework should be introduced before destructive/transformative schema changes are needed.
+Development may auto-migrate. Production must make migration ownership explicit. A versioned migration framework should be introduced before destructive or transformative schema changes are required.
 
 ## Development bootstrap
 
-With Docker Compose, development may seed:
+Development may seed:
 
 ```text
 tenant_dev
 project_dev
 vk_dev / ag_dev_local
+Provider: mock
+Channel:  mock-default
 ```
+
+If `OPENAI_API_KEY` is present, bootstrap creates an OpenAI Provider, encrypts the API key into a Credential record, and persists `openai-default` as a Channel.
 
 `AGENT_GATEWAY_DEV_BOOTSTRAP=true` is rejected in production.
 
 ## In-memory fallback
 
-When `DATABASE_URL` is absent outside production, the server can still use in-memory Session and idempotency stores plus static `AGENT_GATEWAY_KEYS`.
+When `DATABASE_URL` is absent outside production, the server can use in-memory Session/idempotency stores and legacy static Channel configuration.
 
-This path exists for adapter development and tests. It is not a SaaS deployment mode.
+This exists for adapter development and tests. It is not a SaaS deployment mode.
