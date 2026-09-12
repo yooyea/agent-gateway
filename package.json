@@ -1,6 +1,6 @@
 {
   "name": "agent-gateway",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "description": "Open-source Agent API gateway for routing, tenancy, session affinity, metering and billing across agent runtimes.",
   "workspaces": ["apps/*", "packages/*"],
