@@ -4,11 +4,11 @@
 
 The Data Plane should look like an Agents API, not like a proprietary gateway protocol.
 
-The first compatibility target is the OpenAI Agents API Session surface. Gateway-specific selection and policy are expressed through headers so standard request bodies remain portable.
+The first compatibility target is the OpenAI Agents API Session surface. Gateway-specific routing, admission and budget policy use HTTP headers so provider-compatible request bodies remain portable.
 
 The Control Plane uses gateway-native resources under `/api/gateway/*`.
 
-## 2. Authentication
+## 2. Authentication and scope
 
 ### Data Plane
 
@@ -16,7 +16,15 @@ The Control Plane uses gateway-native resources under `/api/gateway/*`.
 Authorization: Bearer ag_xxx
 ```
 
-A Virtual Key resolves to Tenant and optional Project context. In the durable path plaintext is never stored; authentication hashes the presented secret and looks up the hash.
+A Virtual Key resolves to exactly one Tenant and optionally one Project. Durable storage keeps only the key hash and display prefix.
+
+Scope rules:
+
+- Tenant-level key: may access Sessions in that Tenant across Projects.
+- Project-scoped key: may access only Sessions whose durable `project_id` matches the key Project.
+- Cross-Tenant Session access is always hidden as not found.
+
+Billing attribution is taken from the durable Session Tenant/Project, not from caller-supplied identity fields.
 
 ### Control Plane
 
@@ -26,9 +34,7 @@ Normal Control Plane access uses persisted Principal tokens:
 Authorization: Bearer agcp_xxx
 ```
 
-The Principal resolves to Role Bindings and permissions.
-
-The environment value `AGENT_GATEWAY_ADMIN_TOKEN` remains supported only as bootstrap / break-glass access. It is represented internally as a synthetic global owner and is not stored in Postgres.
+The environment value `AGENT_GATEWAY_ADMIN_TOKEN` remains bootstrap / break-glass access only.
 
 Control Plane responses, including errors, include:
 
@@ -36,14 +42,13 @@ Control Plane responses, including errors, include:
 X-Request-Id: req_...
 ```
 
-A caller-supplied `X-Request-Id` is preserved up to 256 characters; otherwise the gateway creates one. Audit events persist the same request id.
+The same request id is persisted on relevant AuditEvents.
 
-## 3. Data Plane
-
-### Create Session
+## 3. Create Session
 
 ```http
 POST /agents/sessions
+Authorization: Bearer ag_...
 Idempotency-Key: caller-generated-key
 ```
 
@@ -52,6 +57,7 @@ Body follows the upstream Agents API shape:
 ```json
 {
   "agent": {
+    "model": "gpt-6-astra",
     "instructions": "Inspect the repository and implement the task."
   },
   "environment": { "type": "none" },
@@ -61,9 +67,48 @@ Body follows the upstream Agents API shape:
 }
 ```
 
-The gateway allocates and persists the `agsess_*` route before making the upstream create call. On success the binding becomes `bound`; on provider error it becomes `failed`.
+### Gateway routing/admission headers
 
-Response preserves provider-native fields but replaces the routing identity:
+```http
+X-Agent-Gateway-Provider: openai-agents
+X-Agent-Gateway-Channel: openai-primary
+X-Agent-Gateway-Required-Capabilities: sandbox,mcp,streaming
+X-Agent-Gateway-Max-Cost-USD: 2.00
+```
+
+`Channel` takes precedence over `Provider`. Required capabilities fail closed.
+
+`X-Agent-Gateway-Max-Cost-USD`:
+
+- must be greater than zero,
+- accepts at most six decimal places,
+- becomes `SessionBudget.max_cost_usd`,
+- participates in the create-session idempotency fingerprint.
+
+Current billing activation rule:
+
+- Tenant without BillingAccount: header is optional and execution remains unbilled/legacy.
+- Tenant with enabled BillingAccount: header is required until plan/default budgets are introduced.
+- Tenant with disabled BillingAccount: billed work is rejected.
+
+### Creation order
+
+The gateway performs:
+
+```text
+select Channel
+  -> allocate agsess_...
+  -> persist SessionBinding(state=creating)
+  -> if billed: reserve max-cost capacity and attach Reservation
+  -> call upstream Provider Session create
+  -> persist bound | failed
+```
+
+If billing admission fails, the upstream Provider is not called.
+
+If Provider creation fails after reservation, the Session becomes `failed` and the active Reservation is released best-effort.
+
+Response preserves provider-native fields but rewrites public routing identity:
 
 ```json
 {
@@ -78,25 +123,33 @@ Response preserves provider-native fields but replaces the routing identity:
 }
 ```
 
-A completed idempotent replay returns the stored response and header:
+A completed idempotent replay adds:
 
 ```http
 X-Agent-Gateway-Idempotent-Replay: true
 ```
 
-### Retrieve Session
+## 4. Retrieve Session
 
 ```http
 GET /agents/sessions/{gateway_session_id}
+Authorization: Bearer ag_...
 ```
 
-The gateway resolves the durable SessionBinding and retrieves state from the pinned Channel.
+The gateway resolves the durable SessionBinding and retrieves provider state from the pinned Channel.
 
-### Submit Session events
+Status retrieval does not require remaining budget because it is used to establish current state. When provider `usage` is present, the gateway attempts best-effort usage observation/settlement.
+
+Project/Tenant scope rules from section 2 apply.
+
+## 5. Submit Session events
 
 ```http
 POST /agents/sessions/{gateway_session_id}/events
+Authorization: Bearer ag_...
 ```
+
+Example body:
 
 ```json
 {
@@ -111,31 +164,81 @@ POST /agents/sessions/{gateway_session_id}/events
 }
 ```
 
-### Stream Session events
+For a billed Session, before forwarding additional Agent work the gateway performs a strict financial preflight:
+
+```text
+retrieve provider Session
+  -> observe cumulative usage
+  -> settle usage delta
+  -> assert remaining SessionBudget
+  -> only then POST events upstream
+```
+
+After successful upstream submission, usage reconciliation is best-effort. A post-success accounting refresh failure is not returned as a false mutation failure; the next expensive operation repeats strict preflight and catches up from cumulative usage.
+
+The current body `idempotency_key` remains provider-compatible. Gateway-level Session-create idempotency uses the HTTP `Idempotency-Key` header.
+
+## 6. Stream Session events
 
 ```http
 GET /agents/sessions/{gateway_session_id}/events
+Authorization: Bearer ag_...
 Accept: text/event-stream
 ```
 
-The gateway streams events from the original bound Channel.
+The gateway performs the same strict usage-refresh + budget preflight before opening the stream and streams from the original bound Channel.
 
-## 4. Gateway routing headers
+After stream completion it best-effort retrieves the provider Session and reconciles cumulative usage.
+
+Current limitation: Provider streaming is opaque bytes at the gateway Provider interface, so v0.5 cannot promise precise mid-stream budget cutoff. Hard admission happens immediately before stream start; cumulative usage is reconciled at completion. Future incremental usage callbacks/events are required for continuous in-flight enforcement.
+
+## 7. Billing admission errors
+
+### Insufficient Tenant billing capacity
 
 ```http
-X-Agent-Gateway-Provider: openai-agents
-X-Agent-Gateway-Channel: openai-primary
-X-Agent-Gateway-Required-Capabilities: sandbox,mcp,streaming
-X-Agent-Gateway-Max-Cost-Usd: 2.00
+HTTP/1.1 402 Payment Required
+X-Agent-Gateway-Limit-Type: billing_capacity
+X-Agent-Gateway-Available-Micros: ...
+X-Agent-Gateway-Requested-Micros: ...
 ```
 
-Channel takes precedence over Provider. Required capabilities fail closed. Max cost is currently persisted as SessionBudget metadata; hard enforcement belongs to the reservation/metering layer.
+### Hard budget required for billed Tenant
 
-Routing hints participate in the Session-create idempotency fingerprint.
+```http
+HTTP/1.1 402 Payment Required
+X-Agent-Gateway-Limit-Type: budget_required
+```
 
-## 5. Control Plane permissions
+### BillingAccount disabled
 
-The current built-in permission vocabulary is:
+```http
+HTTP/1.1 402 Payment Required
+X-Agent-Gateway-Limit-Type: billing_disabled
+```
+
+### Session budget exhausted
+
+```http
+HTTP/1.1 429 Too Many Requests
+X-Agent-Gateway-Limit-Type: budget
+X-Agent-Gateway-Budget-Remaining-Micros: 0
+```
+
+Budget/capacity rejection occurs before new provider work.
+
+## 8. Runtime Channel view
+
+```http
+GET /api/gateway/channels
+Authorization: Bearer ag_xxx
+```
+
+The Data Plane-authenticated view reports runtime health/circuit information without exposing Credential material.
+
+## 9. Control Plane permissions
+
+Current built-in permission vocabulary:
 
 ```text
 tenants.write
@@ -153,18 +256,18 @@ rbac.manage
 audit.read
 ```
 
-Built-in roles are permission bundles:
+Built-in roles:
 
 - `owner` — all permissions.
-- `admin` — all operational permissions and audit access, excluding `rbac.manage`.
+- `admin` — operational permissions and audit access, excluding `rbac.manage`.
 - `operator` — tenant/project/key plus Provider/Credential/Channel operations.
 - `viewer` — read-only Provider/Credential/Channel/RBAC/audit metadata.
 
-Role Bindings are scoped as either `global` or `tenant`.
+Role Bindings are `global` or `tenant` scoped. Provider, Credential, Channel and RBAC resources are global resources.
 
-Provider, Credential, Channel, RBAC and unfiltered Audit operations are global resources. Tenant-scoped bindings cannot authorize those operations.
+Billing management permissions/APIs are not yet exposed in the current Control Plane; the next layer will add explicit billing/pricing/usage/ledger permissions rather than reusing unrelated broad roles implicitly.
 
-## 6. Tenant / Project / Virtual Key Control Plane
+## 10. Tenant / Project / Virtual Key Control Plane
 
 ```text
 POST /api/gateway/admin/tenants
@@ -172,15 +275,15 @@ POST /api/gateway/admin/projects
 POST /api/gateway/admin/virtual-keys
 ```
 
-Required permissions:
+Permissions:
 
 - Tenant create: `tenants.write` global.
 - Project create: `projects.write` global or matching tenant scope.
 - Virtual Key create: `keys.write` global or matching tenant scope.
 
-Virtual Key creation returns `key: "ag_..."` exactly once. Durable storage keeps only the key hash and display prefix.
+Virtual Key creation returns plaintext `key: "ag_..."` exactly once. Durable storage keeps only its hash and display prefix.
 
-## 7. Provider Control Plane
+## 11. Provider Control Plane
 
 ```text
 GET   /api/gateway/admin/providers
@@ -188,27 +291,11 @@ POST  /api/gateway/admin/providers
 PATCH /api/gateway/admin/providers/{provider_id}
 ```
 
-Permissions:
+Permissions: GET `providers.read`; POST/PATCH `providers.write`.
 
-- GET: `providers.read`
-- POST/PATCH: `providers.write`
+`type` must exist in the trusted server-side Provider plugin catalog. Provider config is non-secret; secret-like fields are rejected.
 
-Create example:
-
-```json
-{
-  "type": "openai-agents",
-  "display_name": "OpenAI Agents API",
-  "enabled": true,
-  "config": {}
-}
-```
-
-`type` must exist in the trusted server-side Provider plugin catalog. Database/API input cannot supply an arbitrary module path.
-
-Provider config is non-secret. Secret-like fields are rejected.
-
-## 8. Credential Control Plane
+## 12. Credential Control Plane
 
 ```text
 GET   /api/gateway/admin/credentials
@@ -223,28 +310,9 @@ Permissions:
 - POST/PATCH: `credentials.write`
 - rewrap: `credentials.rewrap`
 
-Create example:
+Credential payloads are encrypted before durable storage. Responses expose metadata only, never plaintext or ciphertext.
 
-```json
-{
-  "provider_id": "agprov_...",
-  "name": "production-openai",
-  "kind": "api_key",
-  "payload": {
-    "apiKey": "sk-..."
-  }
-}
-```
-
-The request payload is encrypted before durable storage. Control Plane responses return Credential metadata only and never return plaintext or ciphertext.
-
-`PATCH` replaces the upstream secret payload and encrypts it with the currently active master key.
-
-`POST .../rewrap` keeps the provider secret unchanged but decrypts/re-encrypts the Credential with the current active master key.
-
-Credential metadata reads and mutations are audited without copying Credential payload/ciphertext into the AuditEvent.
-
-## 9. Channel Control Plane
+## 13. Channel Control Plane
 
 ```text
 GET   /api/gateway/admin/channels
@@ -252,44 +320,13 @@ POST  /api/gateway/admin/channels
 PATCH /api/gateway/admin/channels/{channel_id}
 ```
 
-Permissions:
+Permissions: GET `channels.read`; POST/PATCH `channels.write`.
 
-- GET: `channels.read`
-- POST/PATCH: `channels.write`
+A Channel may reference only a Credential owned by the same Provider. Runtime registry rebuild happens after durable Control Plane commit, while stable Channel IDs preserve existing Session affinity.
 
-Create example:
+## 14. Control Principals and Role Bindings
 
-```json
-{
-  "provider_id": "agprov_...",
-  "credential_id": "agcred_...",
-  "name": "openai-primary",
-  "enabled": true,
-  "priority": 100,
-  "weight": 100,
-  "config": {
-    "baseUrl": "https://api.openai.com/v1",
-    "defaultModel": "gpt-6-astra"
-  }
-}
-```
-
-A Channel may reference only a Credential owned by the same Provider.
-
-Provider/Channel mutations and Credential secret replacement rebuild the in-process runtime registry after the durable Control Plane transaction commits. Stable Channel IDs preserve existing SessionBinding resolution.
-
-### Runtime Channel view
-
-```http
-GET /api/gateway/channels
-Authorization: Bearer ag_xxx
-```
-
-The Data Plane-authenticated view reports runtime health/circuit information without exposing Credential material.
-
-## 10. Control Principals and Role Bindings
-
-### Principals
+Principals:
 
 ```text
 GET   /api/gateway/admin/principals
@@ -297,41 +334,7 @@ POST  /api/gateway/admin/principals
 PATCH /api/gateway/admin/principals/{principal_id}
 ```
 
-Permissions:
-
-- GET: `rbac.read`
-- POST/PATCH: `rbac.manage`
-
-Create example:
-
-```json
-{
-  "name": "platform-ops",
-  "expires_at": "2027-01-01T00:00:00Z"
-}
-```
-
-Create response includes a one-time plaintext token:
-
-```json
-{
-  "id": "agcp_...",
-  "name": "platform-ops",
-  "tokenPrefix": "agcp_...",
-  "enabled": true,
-  "token": "agcp_..."
-}
-```
-
-The full token is never returned again except when an idempotent retry replays the original encrypted-at-rest response.
-
-`PATCH` currently supports enable/disable:
-
-```json
-{ "enabled": false }
-```
-
-### Role Bindings
+Role Bindings:
 
 ```text
 GET    /api/gateway/admin/role-bindings
@@ -339,35 +342,11 @@ POST   /api/gateway/admin/role-bindings
 DELETE /api/gateway/admin/role-bindings/{binding_id}
 ```
 
-Permissions:
+Principal creation returns the full `agcp_...` token exactly once. The full token may only reappear through a completed idempotent replay whose stored envelope is encrypted at rest.
 
-- GET: `rbac.read`
-- POST/DELETE: `rbac.manage`
+RBAC mutation is global-only.
 
-Global binding example:
-
-```json
-{
-  "principal_id": "agcp_...",
-  "role": "admin",
-  "scope_type": "global"
-}
-```
-
-Tenant binding example:
-
-```json
-{
-  "principal_id": "agcp_...",
-  "role": "operator",
-  "scope_type": "tenant",
-  "scope_id": "tenant_..."
-}
-```
-
-RBAC mutation is intentionally global-only. Tenant-scoped bindings cannot call the RBAC management endpoints.
-
-## 11. Audit API
+## 15. Audit API
 
 ```http
 GET /api/gateway/admin/audit
@@ -375,37 +354,11 @@ GET /api/gateway/admin/audit
 
 Permission: `audit.read`.
 
-Supported query parameters:
+Filters include `limit`, `actor_id`, `resource_type`, `resource_id`, `tenant_id`, and `outcome=success|denied|error`.
 
-```text
-limit
-actor_id
-resource_type
-resource_id
-tenant_id
-outcome=success|denied|error
-```
+Audit events are append-only and correlate with Control Plane `X-Request-Id` values.
 
-A caller with only a tenant-scoped `audit.read` binding must supply the matching `tenant_id`. Global callers may query without a tenant filter.
-
-Audit events are append-only and include the same `X-Request-Id` returned by the Control Plane response, including error responses.
-
-Successful mutations, mutation errors, authenticated authorization denials, idempotency conflicts/in-progress failures, and sensitive RBAC/Credential/audit reads generate audit evidence.
-
-## 12. Credential encryption configuration
-
-The runtime keyring is supplied outside the API:
-
-```text
-AGENT_GATEWAY_CREDENTIAL_KEYS
-AGENT_GATEWAY_ACTIVE_CREDENTIAL_KEY_ID
-```
-
-Each configured key must decode from base64 to exactly 32 bytes. Multiple keys may be retained for decryption during rotation; only the active key encrypts new/rewrapped records.
-
-See `docs/credentials.md` for the rotation procedure.
-
-## 13. Error model
+## 16. Error model
 
 Gateway errors use:
 
@@ -420,63 +373,48 @@ Gateway errors use:
 
 Expected HTTP classes:
 
-- `400`: invalid route/policy/capability/input, unknown Provider type, plaintext secret config, invalid role/scope
+- `400`: invalid input/routing/capability/budget-header syntax, unknown Provider type, plaintext secret config, invalid role/scope
 - `401`: invalid/missing Virtual Key or Control Plane Principal/bootstrap token
-- `403`: authenticated Control Plane Principal lacks the required permission/scope
-- `404`: Session/Provider/Credential/Channel/Principal/RoleBinding not found
+- `402`: billed Tenant cannot financially admit new work (capacity, required budget, disabled billing)
+- `403`: authenticated Control Plane Principal lacks permission/scope
+- `404`: scoped resource not found, including cross-Tenant/cross-Project Session access
 - `409`: idempotency, binding-state, duplicate, FK/ownership or state conflict
-- `429`: rate/quota/concurrency/budget admission failure
-- `502/503`: upstream Provider/Channel or required control-plane dependency unavailable
+- `429`: rate/concurrency/session-budget admission failure
+- `502/503`: upstream Provider/Channel or required infrastructure unavailable
 
-Provider-native errors may be retained in protected traces/audit data, but secret-bearing upstream details must not be leaked blindly to callers.
+Provider-native errors may be retained in protected traces/audit data, but secret-bearing upstream details must not be leaked blindly.
 
-## 14. Idempotency semantics
+## 17. Idempotency semantics
 
 ### Data Plane Session creation
 
-Session creation uses `Idempotency-Key` scoped by:
+HTTP `Idempotency-Key` is scoped by:
 
 ```text
 Tenant + VirtualKey + operation + Idempotency-Key
 ```
 
+The fingerprint includes body, routing hints, capability hints and Session budget hint.
+
+Outcomes:
+
+- first request: pending claim and execute
+- same key + different fingerprint: `409`
+- same key + same fingerprint while pending: `409`
+- completed key: replay original response
+- expired key: may be claimed again
+
+If execution fails before a successful upstream side effect, the Postgres pending claim is released so a corrected retry need not wait for pending TTL expiry.
+
+If upstream work succeeded but durable idempotency completion fails, the claim is deliberately not released; allowing immediate replay could duplicate provider work.
+
 ### Control Plane mutations
 
-Every current management mutation under `/api/gateway/admin/*` accepts the same HTTP header:
+Management mutations accept the same HTTP header but are scoped by ControlPrincipal/bootstrap actor + operation + key.
 
-```http
-Idempotency-Key: caller-generated-key
-```
+Control Plane replay state can contain one-time secrets and is therefore encrypted at rest. Resource mutation, success AuditEvent and idempotency completion commit atomically.
 
-Control Plane keys are scoped by:
-
-```text
-ControlPrincipal (or bootstrap actor) + operation/action + Idempotency-Key
-```
-
-The request fingerprint includes the complete semantic request. Secret Credential payload values participate in the in-memory hash so changing a secret with the same key is a conflict; only the SHA-256 fingerprint is persisted. Secret request bodies are not copied into idempotency or Audit rows.
-
-Outcomes for both Data Plane and Control Plane claims are:
-
-- first request: claim pending and execute
-- same key, different fingerprint: `409`
-- same key, same fingerprint while pending: `409` in progress
-- same key after completion: replay original response
-- after TTL expiry: key may be claimed again
-
-A Control Plane replay adds:
-
-```http
-X-Agent-Gateway-Idempotent-Replay: true
-```
-
-Control Plane replay envelopes are encrypted at rest with the gateway Credential keyring. This is required because a replay can contain a one-time Principal token or Virtual Key secret. Resource mutation, success AuditEvent, and idempotency completion commit atomically in one Postgres transaction. On failure the resource and success audit roll back together; the gateway then appends a separate error AuditEvent.
-
-Session input/tool events continue to use the upstream-compatible body field `idempotency_key`.
-
-## 15. Identifier prefixes
-
-Current/new resource patterns include:
+## 18. Identifier prefixes
 
 ```text
 tenant_     Tenant
@@ -487,10 +425,14 @@ agprov_     Provider
 agcred_     Credential
 agch_       Channel
 agsess_     Session
-agcp_       Control Principal record / token prefix family
+agres_      Reservation
+agprice_    PriceRule
+agusg_      UsageEvent
+agled_      LedgerEntry
+agcp_       Control Principal / token family
 agrb_       Role Binding
 agaud_      Audit Event
-req_        generated request correlation id
+req_        request correlation id
 ```
 
 Identifiers are opaque to clients.
