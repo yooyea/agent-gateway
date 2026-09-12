@@ -1,48 +1,45 @@
-# AGENTS.md
+# Agent Gateway Engineering Rules
 
-## Mission
+Agent Gateway is an independent Agent API gateway / SaaS infrastructure product. It is not coupled to LineHalo or any other caller product.
 
-Build a product-neutral **Agent API Gateway**: an open-source gateway and SaaS control plane for routing, governing, metering and billing stateful agent executions across heterogeneous agent runtimes.
+## Product boundary
 
-No caller product is part of this repository's domain model. No single provider is the architecture.
-
-## Core ontology
-
-The central runtime chain is:
+The gateway sits between arbitrary callers and heterogeneous Agent runtimes.
 
 ```text
-Tenant -> Project -> VirtualKey -> Session -> Execution
-                                 -> Channel -> Provider
-                                            -> Credential
-Session -> Usage -> Cost -> Reservation -> Ledger
-
-ControlPrincipal -> RoleBinding -> Permission
-ControlPrincipal -> AuditEvent
+Caller -> Agent Gateway -> Provider Channel -> Agent Runtime
 ```
 
-`Session + Execution + Billing` is the architecture core.
+Callers integrate with the gateway, not with a specific upstream account. The gateway owns authentication, routing, Session affinity, metering, billing, governance and observability concerns that should not be reimplemented by every product.
 
-## Non-negotiable architecture rules
+## Core domain
 
-- Data Plane and Control Plane are separate concepts even when temporarily served by one process.
-- The public session ID is always gateway-owned and stable (`agsess_*`). Never expose a provider session ID as the routing identity.
-- A created session is pinned to one Channel. Every subsequent event, read and stream must resolve through that binding.
-- Provider, Channel and Credential are different entities. Provider is adapter identity; Channel is a routable instance; Credential is secret material.
-- A disabled/open-circuit Channel may be excluded from new Session routing but must remain resolvable for Sessions already bound to it.
-- Product code must never import provider SDKs directly.
-- Provider-specific translation stays inside provider packages.
-- Provider type -> plugin-module resolution is trusted server configuration. Never allow a database row or external API payload to import an arbitrary module path.
-- Required capabilities must never be silently degraded.
-- Native and emulated capabilities must be distinguishable.
-- Provider secrets must be stored through Credential resources, never plaintext Provider/Channel config.
-- Credential master encryption keys must stay outside Postgres and must never appear in API responses, logs, traces or audit payloads.
-- Credential rotation must retain old decrypt keys until all affected Credentials have been rewrapped and verified.
-- Tenant isolation is mandatory on every session lookup and mutation.
-- Every production mutation must support idempotency.
-- Streaming/event semantics are protocol behavior, not UI behavior.
-- Usage is not the ledger. Provider usage may be delayed or corrected; billing must support reconciliation.
-- Budget enforcement must reserve capacity before execution instead of relying only on after-the-fact charging.
+The core architecture is centered on:
+
+```text
+Session + Execution + Billing
+```
+
+Provider model calls are implementation details inside an Agent lifecycle. Do not reduce the product back to an LLM request proxy.
+
+## Provider / Channel rules
+
+- Provider means adapter/runtime type.
+- Channel means one routable Provider instance/account/configuration.
+- Credentials are separate encrypted resources and never plaintext Provider/Channel config.
+- A Channel may reference only a Credential owned by the same Provider.
+- Database configuration may select only trusted installed Provider plugins; never load arbitrary module paths from tenant input.
+- Provider plugins translate provider-native semantics at the boundary; core routing must not contain vendor-specific SDK logic.
+
+## Session rules
+
+- Public Session IDs are gateway-owned `agsess_*` identifiers.
+- Persist the selected Channel before contacting the upstream provider.
+- SessionBinding transitions through `creating -> bound | failed`.
+- Once bound, every operation returns to the original Channel.
+- Circuit breakers, disabled Channels and routing policy affect new Sessions only.
 - Never make a live session silently jump providers or channels. Migration is explicit and has lineage + declared semantic loss.
+- A Project-scoped Virtual Key may access only Sessions belonging to that same Project. Tenant-level keys may access Sessions across Projects in the Tenant.
 
 ## Control Plane authorization rules
 
@@ -67,6 +64,32 @@ ControlPrincipal -> AuditEvent
 - Runtime side effects derived from Control Plane state (for example registry reload) happen after durable commit and must not turn an already-committed mutation into a false retry signal.
 - Bearer tokens, Virtual Key plaintext, Credential payloads, ciphertext, master keys and decrypted upstream credentials must never enter audit metadata.
 - Every Control Plane response, including failures, must expose the same request id used by its audit evidence.
+
+## Data Plane billing rules
+
+- Postgres financial state is authoritative. Redis must never become a balance, Reservation, UsageEvent or Ledger source of truth.
+- A Tenant with a BillingAccount is billed. Until plan/default budgets exist, every new billed Session must declare a positive hard `max_cost_usd`.
+- A billed Session must persist its `creating` SessionBinding and reserve customer capacity **before** the upstream Provider is contacted.
+- If financial admission fails, do not call the Provider.
+- Provider Session creation failure must release the attached active Reservation best-effort; Reservation expiry remains the safety net.
+- Active Reservation exposure is the unconsumed amount. Spend already represented in the customer Ledger must not also remain fully reserved.
+- Before additional Agent work, refresh cumulative provider usage, settle the delta and evaluate remaining SessionBudget before contacting the Provider.
+- Usage refresh/budget admission before provider work is fail-closed for billed Sessions.
+- Once an upstream mutation has succeeded, post-operation usage reconciliation is best-effort; an accounting-refresh failure must not turn provider success into a false client retry signal.
+- The next expensive operation must catch up through strict preflight reconciliation.
+- Data Plane idempotency claims may be released when execution fails before a successful upstream side effect. After upstream success, a failed idempotency completion must fail closed rather than make immediate duplicate execution possible.
+- Long opaque SSE streams currently enforce budget at stream admission and reconcile on completion. Do not claim mid-stream hard-stop precision until provider usage is observable during the stream.
+
+## Financial data rules
+
+- `UsageEvent` is append-only measured evidence.
+- `UsageSettlement` stores settlement processing state separately from immutable UsageEvent evidence.
+- `LedgerEntry` is immutable financial truth.
+- Provider cumulative usage is converted to deltas under a durable Session + metric counter lock.
+- UsageCounter keeps a provider measurement watermark; stale/out-of-order observations must not move it backward.
+- Provider corrections append negative adjustment UsageEvents and refund/adjustment LedgerEntries instead of rewriting history.
+- Effective PriceRules are snapshotted into LedgerEntries. Later price changes never rewrite historical charges.
+- Money is stored in integer micros / exact database numeric arithmetic. JavaScript floating point is not a financial source of truth.
 
 ## Northbound API rule
 
@@ -101,7 +124,7 @@ Control Plane domains include:
 
 ## Persistence rule
 
-- Postgres is the durable source of truth for identity, RBAC, audit, Provider/Channel/Credential configuration, SessionBindings, idempotency and future financial records.
+- Postgres is the durable source of truth for identity, RBAC, audit, Provider/Channel/Credential configuration, SessionBindings, idempotency and financial records.
 - Redis contains only reconstructable or lease-based runtime state: cache, rate windows, concurrency leases and circuit state.
 - Master Credential encryption keys come from the runtime secret boundary (environment/KMS integration), never Postgres.
 - In-memory stores and environment-backed caller keys are development adapters only.
