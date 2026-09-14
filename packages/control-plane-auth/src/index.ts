@@ -15,7 +15,15 @@ export type ControlPlanePermission =
   | "channels.write"
   | "rbac.read"
   | "rbac.manage"
-  | "audit.read";
+  | "audit.read"
+  | "billing.accounts.read"
+  | "billing.accounts.write"
+  | "billing.pricing.read"
+  | "billing.pricing.write"
+  | "billing.credits.write"
+  | "billing.usage.read"
+  | "billing.ledger.read"
+  | "billing.reservations.read";
 
 export type ControlPlaneRole = "owner" | "admin" | "operator" | "viewer";
 export type RoleScopeType = "global" | "tenant";
@@ -34,6 +42,22 @@ const ALL_PERMISSIONS: ControlPlanePermission[] = [
   "rbac.read",
   "rbac.manage",
   "audit.read",
+  "billing.accounts.read",
+  "billing.accounts.write",
+  "billing.pricing.read",
+  "billing.pricing.write",
+  "billing.credits.write",
+  "billing.usage.read",
+  "billing.ledger.read",
+  "billing.reservations.read",
+];
+
+const BILLING_READ_PERMISSIONS: ControlPlanePermission[] = [
+  "billing.accounts.read",
+  "billing.pricing.read",
+  "billing.usage.read",
+  "billing.ledger.read",
+  "billing.reservations.read",
 ];
 
 const ROLE_PERMISSIONS: Record<ControlPlaneRole, ReadonlySet<ControlPlanePermission>> = {
@@ -50,6 +74,7 @@ const ROLE_PERMISSIONS: Record<ControlPlaneRole, ReadonlySet<ControlPlanePermiss
     "credentials.rewrap",
     "channels.read",
     "channels.write",
+    ...BILLING_READ_PERMISSIONS,
   ]),
   viewer: new Set([
     "providers.read",
@@ -57,6 +82,7 @@ const ROLE_PERMISSIONS: Record<ControlPlaneRole, ReadonlySet<ControlPlanePermiss
     "channels.read",
     "rbac.read",
     "audit.read",
+    ...BILLING_READ_PERMISSIONS,
   ]),
 };
 
@@ -516,9 +542,6 @@ export class PostgresControlPlaneSecurity {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      // Opportunistically clean unrelated expired records on every mutation so abandoned
-      // one-shot keys cannot grow without bound. Exact-key cleanup remains mandatory so a
-      // large backlog can never block reuse of this specific expired key.
       await client.query(
         `DELETE FROM gateway_control_idempotency
          WHERE ctid IN (
