@@ -9,6 +9,7 @@
   "dependencies": {
     "@agent-gateway/billing-postgres": "0.5.0",
     "@agent-gateway/core": "0.2.0",
-    "@agent-gateway/protocol": "0.2.0"
+    "@agent-gateway/protocol": "0.2.0",
+    "@agent-gateway/storage-postgres": "0.3.0"
   }
 }
