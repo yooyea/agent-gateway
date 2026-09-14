@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.6.0 - 2026-09-14
+
+### Billing Control Plane
+
+- Added governed Billing management under `/api/gateway/admin/billing/*`.
+- Added BillingAccount read/upsert and live exposure reporting for ledger balance, active Reservation holds and available capacity.
+- Added effective-dated PriceRule list/create APIs; PriceRules remain append-oriented so historical settlement snapshots are never rewritten.
+- Added explicit credit grants backed by immutable customer Ledger entries.
+- Added audited UsageEvent, LedgerEntry and Reservation query APIs.
+
+### Financial authorization
+
+- Added explicit billing-domain permissions for account, pricing, credit, usage, ledger and Reservation operations.
+- `owner` and `admin` may perform billing/policy writes.
+- `operator` and `viewer` are billing read-only.
+- Tenant-scoped RoleBindings authorize only the matching Tenant.
+- Global PriceRule operations and cross-Tenant/unfiltered financial reads require a global binding.
+
+### Transaction, idempotency and audit
+
+- Every billing mutation requires `Idempotency-Key`.
+- Billing mutation, success AuditEvent and encrypted idempotency completion share the existing Control Plane Postgres transaction.
+- Failed financial mutations roll back before a separate error AuditEvent is appended.
+- Completed billing replays do not execute the financial mutation again and create current-request audit evidence.
+- Financial request bodies use exact integer micros strings; no floating-point money inputs are accepted.
+- Credit Ledger idempotency is scoped by actor + billing action + Tenant + management key.
+
+### Validation
+
+- Added Billing RBAC scope tests covering global vs Tenant bindings and write vs read-only roles.
+- Added real Postgres tests proving BillingAccount mutation and success AuditEvent commit/rollback atomically.
+- Existing Data Plane billing, immutable Usage/Ledger, RBAC/Audit, Postgres 17 and Redis 7 suites remain release gates.
+
 ## 0.5.0 - 2026-09-13
 
 ### Financial foundation
@@ -16,24 +49,27 @@
 ### Data Plane billing runtime
 
 - Added `@agent-gateway/billing-runtime` as the lifecycle boundary between Agent Sessions and billing persistence.
-- A Tenant with a BillingAccount now requires a positive hard Session `max_cost_usd` before new billed Session creation.
+- A Tenant with a BillingAccount requires a positive hard Session max-cost budget before new billed Session creation.
+- The northbound decimal max-cost header is normalized directly into exact integer micros without JavaScript floating-point conversion.
 - Billed Session capacity is reserved and attached to the durable `agsess_*` record before the upstream Provider is contacted.
-- Failed provider Session creation releases the active Reservation best-effort; Reservation expiry remains the safety net.
-- Added strict preflight usage refresh, settlement and SessionBudget admission before `POST /events` and event streaming.
+- A Reservation is released automatically only for failures known to occur before Provider invocation; ambiguous post-provider failures retain the financial hold until reconciliation/expiry handling.
+- Added strict preflight usage refresh, settlement, customer-pricing validation, renewable Reservation admission and SessionBudget enforcement before `POST /events` and event streaming.
+- Added per-Session exclusive runtime leases so overlapping Agent work cannot both pass the same budget snapshot.
 - Added best-effort post-provider usage reconciliation so a successful upstream mutation is not misreported as failed solely because local accounting refresh failed.
-- Added HTTP 402 billing-capacity / budget-required / billing-disabled responses and HTTP 429 hard SessionBudget responses with gateway limit headers.
+- Added HTTP 402 billing-capacity / budget-required / billing-disabled responses, HTTP 429 hard SessionBudget responses, and fail-closed unresolved-pricing responses.
 - Added Project-level Session isolation for Project-scoped Virtual Keys while retaining Tenant-wide access for Tenant-level keys.
-- Failed Data Plane execution now releases a pending Postgres idempotency claim when no successful upstream side effect occurred.
+- Session-create idempotency claims are released only for failures known to occur before Provider work; potentially side-effecting failures remain pending to prevent duplicate Sessions/spend.
 
 ### Validation
 
 - Added real Postgres tests for concurrent Reservation admission, cumulative usage deduplication, first-observation concurrency, stale snapshot rejection, provider corrections, price snapshots and immutable Usage/Ledger history.
-- Added billing-runtime lifecycle tests for pre-provider Reservation, failed-binding release, billed-budget requirement, unbilled compatibility and GatewaySession usage normalization.
+- Added billing-runtime lifecycle tests for exact-micros budgets, pre-provider Reservation, ambiguous hold retention, billed-budget requirement, unbilled compatibility, unresolved pricing and renewable Reservation capacity.
+- Shared-Postgres integration suites run serially to avoid test-only DDL races.
 - Existing Postgres 17 + Redis 7 CI remains the release gate.
 
 ### Known boundary
 
-- Provider SSE streams are currently opaque bytes, so v0.5 enforces budget before stream admission and reconciles cumulative provider usage after stream completion. Precise mid-stream cutoff requires incremental provider usage observability.
+- Provider SSE streams are currently opaque bytes, so v0.5/v0.6 enforce budget before stream admission and reconcile cumulative provider usage after stream completion. Precise mid-stream cutoff requires incremental provider usage observability.
 
 ## 0.4.1 - 2026-09-12
 
@@ -42,11 +78,11 @@
 - Control Plane resource mutations and their success AuditEvents now commit atomically in one Postgres transaction.
 - Added actor-scoped Control Plane `Idempotency-Key` persistence for management mutations.
 - Idempotency responses that may contain one-time secrets are encrypted before durable replay storage.
-- Principal and Virtual Key creation can now safely replay the original one-time secret response after a lost response/retry.
+- Principal and Virtual Key creation can safely replay the original one-time secret response after a lost response/retry.
 - Mutation failures roll back the resource, success audit, and idempotency completion together; pending idempotency claims are released after rollback.
-- Control Plane error responses now preserve the same `X-Request-Id` used by authorization-denial and mutation-error AuditEvents.
+- Control Plane error responses preserve the same `X-Request-Id` used by authorization-denial and mutation-error AuditEvents.
 - Split the Control Plane HTTP implementation out of the Data Plane server entrypoint so RBAC, audit, transaction and idempotency semantics have one explicit boundary.
-- Runtime-registry reload happens only after the durable Control Plane transaction commits, preventing rolled-back Channel/Provider changes from leaking into in-memory routing state.
+- Runtime-registry reload happens only after the durable Control Plane transaction commits.
 
 ### Validation
 
@@ -97,7 +133,7 @@
 ### Persistent runtime supply
 
 - Added durable `Provider`, `Credential`, and `Channel` resources in Postgres.
-- Persistent Channel configuration is now the runtime source of truth when Postgres is enabled.
+- Persistent Channel configuration is the runtime source of truth when Postgres is enabled.
 - Added trusted Provider type -> installed plugin mapping; database rows cannot import arbitrary modules.
 - Added live runtime-registry rebuild after Provider, Credential, and Channel mutations.
 - Disabled Channels remain resolvable for existing bound Sessions while being excluded from new-session routing.
@@ -113,7 +149,7 @@
 - Added upstream secret replacement through the Credential resource.
 - Redacted encrypted payloads from Control Plane list responses.
 - Provider/Channel plaintext config rejects secret-like field names.
-- Development OpenAI bootstrap now persists `OPENAI_API_KEY` as an encrypted Credential rather than plaintext Channel config.
+- Development OpenAI bootstrap persists `OPENAI_API_KEY` as an encrypted Credential rather than plaintext Channel config.
 
 ### Validation
 
@@ -144,7 +180,7 @@
 
 - Added `@agent-gateway/storage-postgres`.
 - Added Postgres-backed Tenant, Project, Virtual Key, Session Directory and idempotency persistence.
-- Virtual Key plaintext is no longer stored in the durable path; only SHA-256 hash and display prefix are persisted.
+- Virtual Key plaintext is not stored in the durable path; only SHA-256 hash and display prefix are persisted.
 - Added Session Binding lifecycle states `creating`, `bound`, and `failed` so the selected Channel is durably recorded before the upstream session call.
 - Added `Idempotency-Key` support for session creation with canonical request hashing, conflict detection and completed-response replay.
 - Added separate pending/completed idempotency TTLs.
