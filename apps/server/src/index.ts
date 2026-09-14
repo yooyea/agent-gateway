@@ -26,6 +26,7 @@ import {
   PostgresDataPlaneBillingStore,
   SessionBudgetExceededError,
   SessionBudgetRequiredError,
+  usdToMicros,
 } from "@agent-gateway/billing-runtime";
 import { PostgresControlPlaneSecurity } from "@agent-gateway/control-plane-auth";
 import { CredentialKeyring, credentialContext } from "@agent-gateway/credential-crypto";
@@ -432,23 +433,24 @@ function routeHints(req: http.IncomingMessage): RouteHints {
     ? capabilityHeader.split(",").map((item) => item.trim()).filter(Boolean) as AgentCapability[]
     : undefined;
 
-  let maxCostUsd: number | undefined;
+  let maxCostMicros: string | undefined;
   if (typeof maxCostHeader === "string") {
     const raw = maxCostHeader.trim();
     if (!/^\d+(?:\.\d{1,6})?$/.test(raw)) {
       throw new Error("X-Agent-Gateway-Max-Cost-USD must be a positive decimal with at most 6 fractional digits");
     }
-    maxCostUsd = Number(raw);
-    if (!Number.isFinite(maxCostUsd) || maxCostUsd <= 0) {
+    const micros = usdToMicros(raw);
+    if (micros <= 0n) {
       throw new Error("X-Agent-Gateway-Max-Cost-USD must be greater than zero");
     }
+    maxCostMicros = micros.toString();
   }
 
   return {
     provider: typeof provider === "string" ? provider : undefined,
     channel: typeof channel === "string" ? channel : undefined,
     requiredCapabilities,
-    budget: maxCostUsd === undefined ? undefined : { max_cost_usd: maxCostUsd },
+    budget: maxCostMicros === undefined ? undefined : { max_cost_micros: maxCostMicros },
   };
 }
 
@@ -585,9 +587,6 @@ async function executeIdempotent<T>(input: {
   try {
     result = await input.run();
   } catch (error) {
-    // Release only failures that are proven to occur before any Provider side effect.
-    // Unknown failures remain pending until TTL/reconciliation because provider Session
-    // creation may already have succeeded even when local binding persistence failed.
     if (knownPreProviderFailure(error)) {
       await releaseDataPlaneIdempotency({
         context: input.context,
@@ -599,8 +598,6 @@ async function executeIdempotent<T>(input: {
     throw error;
   }
 
-  // Once provider work has succeeded, do not release the claim if durable completion
-  // fails: keeping it pending is safer than allowing an immediate duplicate execution.
   await persistence.idempotency.complete({
     tenantId: input.context.tenantId,
     virtualKeyId: input.context.virtualKeyId,
