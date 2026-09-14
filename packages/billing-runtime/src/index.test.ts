@@ -61,7 +61,7 @@ class FakeBilling implements BillingRuntimeStore {
   }): Promise<ReservationRecord> {
     this.calls.push(`reserve:${input.requestRef}:${input.amountMicros}`);
     const reservation: ReservationRecord = {
-      id: "agres_1",
+      id: `agres_${this.reservations.size + 1}`,
       tenantId: input.tenantId,
       projectId: input.projectId,
       requestRef: input.requestRef,
@@ -125,7 +125,7 @@ function sessionRecord(budget: SessionRecord["budget"] = { max_cost_usd: 2 }): S
   };
 }
 
-test("billing session store reserves before provider work and releases on failed binding", async () => {
+test("billing session store reserves before provider work and preserves hold after ambiguous binding failure", async () => {
   const base = new MemorySessionStore();
   const billing = new FakeBilling();
   const store = new BillingSessionStore(base, billing, { reservationTtlSeconds: 60 });
@@ -140,8 +140,24 @@ test("billing session store reserves before provider work and releases on failed
   ]);
   assert.equal((await billing.getSessionReservation(record.id))?.state, "active");
 
-  await store.update({ ...record, state: "failed", lastError: "provider failed" });
-  assert.equal((await billing.getSessionReservation(record.id))?.state, "released");
+  await store.update({ ...record, state: "failed", lastError: "binding persistence failed" });
+  assert.equal(
+    (await billing.getSessionReservation(record.id))?.state,
+    "active",
+    "generic failed binding must not release exposure after provider invocation may have happened",
+  );
+});
+
+test("exact micros budget bypasses JavaScript floating point", async () => {
+  const base = new MemorySessionStore();
+  const billing = new FakeBilling();
+  const store = new BillingSessionStore(base, billing);
+  const exact = "123456789012123456";
+  const record = sessionRecord({ max_cost_micros: exact });
+
+  await store.create(record);
+  assert.equal((await billing.getSessionReservation(record.id))?.amountMicros, exact);
+  assert.equal(billing.calls.includes(`reserve:session:agsess_1:${exact}`), true);
 });
 
 test("billed tenant without a hard session budget fails before provider work", async () => {
