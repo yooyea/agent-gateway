@@ -186,9 +186,11 @@ Authorization: Bearer ag_xxx
 
 Returns Channel runtime/circuit health without Credential material.
 
-## 9. Core Control Plane permissions
+## 9. Control Plane permissions
 
-Core permission vocabulary:
+The authoritative permission vocabulary and role mapping live in `@agent-gateway/control-plane-auth`. Billing does not maintain a second HTTP-local role policy.
+
+Core permissions:
 
 ```text
 tenants.write
@@ -206,13 +208,7 @@ rbac.manage
 audit.read
 ```
 
-Role Bindings are `global` or `tenant` scoped.
-
-Provider, Credential, Channel and RBAC resources are gateway-global. Project and Virtual Key lifecycle may carry Tenant scope.
-
-## 10. Billing Control Plane permissions
-
-Billing is a governed subdomain with its own permission vocabulary:
+Billing permissions:
 
 ```text
 billing.accounts.read
@@ -227,19 +223,23 @@ billing.reservations.read
 
 Role bundles:
 
-- `owner`: all billing permissions.
-- `admin`: all billing permissions.
-- `operator`: billing reads only.
-- `viewer`: billing reads only.
+- `owner`: all permissions.
+- `admin`: all operational and Billing permissions except `rbac.manage`.
+- `operator`: existing operational permissions plus Billing reads only.
+- `viewer`: existing read permissions plus Billing reads only.
 
-Scope rules:
+Role Bindings are `global` or `tenant` scoped.
+
+Provider, Credential, Channel and RBAC resources are gateway-global. Project, Virtual Key and Billing Tenant resources may carry Tenant scope.
+
+Billing scope rules:
 
 - global binding may operate across Tenants;
 - Tenant binding may operate only on that Tenant;
 - global PriceRule operations require global scope;
 - unfiltered/cross-Tenant financial reads require global scope.
 
-## 11. BillingAccount API
+## 10. BillingAccount API
 
 ### Read BillingAccount
 
@@ -291,7 +291,7 @@ Response includes:
 }
 ```
 
-## 12. PriceRule API
+## 11. PriceRule API
 
 ### List rules
 
@@ -301,9 +301,9 @@ GET /api/gateway/admin/billing/price-rules?tenant_id=tenant_...
 
 Permission: `billing.pricing.read`.
 
-A Tenant-scoped caller must provide its matching `tenant_id`. The result may include applicable global rules because they contribute to that Tenant's effective pricing.
+A Tenant-scoped caller must provide its matching `tenant_id` and receives only PriceRules explicitly owned by that Tenant. Raw global PriceRule rows are gateway-global configuration and require a global binding to read.
 
-Omitting `tenant_id` is a global/unfiltered operation and requires global scope.
+A global caller may request a Tenant view and receive the applicable Tenant + global rules, or omit `tenant_id` for a global/unfiltered listing.
 
 ### Create rule
 
@@ -349,7 +349,7 @@ v0.6 does not expose in-place PriceRule update/delete. New pricing is represente
 
 A rule without `tenant_id` is global and requires a global RoleBinding.
 
-## 13. Credit API
+## 12. Credit API
 
 ```http
 POST /api/gateway/admin/billing/credits
@@ -372,7 +372,7 @@ The operation appends an immutable customer Ledger entry with kind `credit.grant
 
 It does not mutate historical Ledger rows.
 
-## 14. Financial read APIs
+## 13. Financial read APIs
 
 Usage:
 
@@ -402,7 +402,7 @@ Tenant-scoped callers must query their Tenant. Omitting `tenant_id` is a global/
 
 All these reads are audited.
 
-## 15. Billing mutation idempotency and atomicity
+## 14. Billing mutation idempotency and atomicity
 
 Every Billing Control Plane mutation requires:
 
@@ -410,7 +410,9 @@ Every Billing Control Plane mutation requires:
 Idempotency-Key: caller-generated-key
 ```
 
-Scope:
+Missing/invalid management idempotency headers are authenticated mutation failures and therefore produce `outcome=error` AuditEvents.
+
+Management idempotency scope:
 
 ```text
 ControlPrincipal/bootstrap actor + billing action + Idempotency-Key
@@ -437,9 +439,15 @@ X-Agent-Gateway-Idempotent-Replay: true
 
 and records current-request audit evidence.
 
-Credit Ledger idempotency is further scoped by actor + credit action + Tenant + management key.
+Credit grant adds a permanent immutable-Ledger identity scoped by:
 
-## 16. Tenant / Project / Virtual Key Control Plane
+```text
+actor + credit action + Tenant + management key + semantic request fingerprint
+```
+
+The semantic fingerprint prevents a reclaimed/expired management key with a changed amount/reason from resolving to an older Ledger credit.
+
+## 15. Tenant / Project / Virtual Key Control Plane
 
 ```text
 POST /api/gateway/admin/tenants
@@ -455,7 +463,7 @@ Permissions:
 
 Virtual Key plaintext is returned exactly once; durable storage keeps hash + display prefix.
 
-## 17. Provider / Credential / Channel Control Plane
+## 16. Provider / Credential / Channel Control Plane
 
 Providers:
 
@@ -484,7 +492,7 @@ PATCH /api/gateway/admin/channels/{channel_id}
 
 Credential payloads are encrypted and never returned. Channel may reference only a Credential owned by the same Provider. Runtime registry rebuild happens after durable Control Plane commit.
 
-## 18. Principals / Role Bindings / Audit
+## 17. Principals / Role Bindings / Audit
 
 Principals:
 
@@ -510,7 +518,7 @@ GET /api/gateway/admin/audit
 
 Audit supports actor/resource/Tenant/outcome filters and is append-only.
 
-## 19. Error model
+## 18. Error model
 
 Gateway errors use:
 
@@ -534,7 +542,7 @@ Expected HTTP classes:
 - `429`: rate/concurrency/session-budget admission failure.
 - `502/503`: Provider/Channel/infrastructure or required pricing unavailable.
 
-## 20. Data Plane idempotency
+## 19. Data Plane idempotency
 
 Session creation HTTP idempotency scope:
 
@@ -548,7 +556,7 @@ A pending claim is released only for failures known to occur before Provider inv
 
 Session event body `idempotency_key` remains provider-compatible.
 
-## 21. Identifier prefixes
+## 20. Identifier prefixes
 
 ```text
 tenant_     Tenant
