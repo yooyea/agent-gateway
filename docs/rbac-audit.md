@@ -29,7 +29,9 @@ Built-in roles remain intentionally small:
 - `operator` — operational resource management, no privilege escalation.
 - `viewer` — read-oriented access.
 
-A role is a permission bundle. HTTP/domain authorization should test explicit permissions rather than hard-code ad-hoc role checks.
+A role is a permission bundle. HTTP/domain authorization tests explicit permissions rather than hard-coding ad-hoc role checks.
+
+The authoritative permission vocabulary and role mapping live in `@agent-gateway/control-plane-auth`. Billing uses the same `hasPermission` / `requirePermission` evaluator through the package's billing submodule; it does not maintain a second handler-local role policy.
 
 ## Scopes
 
@@ -46,7 +48,7 @@ RBAC management remains global-only.
 
 ## Billing-domain permissions
 
-v0.6 adds an explicit billing permission namespace:
+v0.6 adds these permissions to the central Control Plane permission vocabulary:
 
 ```text
 billing.accounts.read
@@ -59,7 +61,7 @@ billing.ledger.read
 billing.reservations.read
 ```
 
-Billing permission bundles:
+Billing role bundles:
 
 - `owner` — billing read + write.
 - `admin` — billing read + write.
@@ -68,9 +70,7 @@ Billing permission bundles:
 
 Tenant-scoped billing authorization applies only to the matching Tenant.
 
-Global PriceRule operations and unfiltered/cross-Tenant financial reads require a global binding.
-
-Billing permissions are domain-owned but still evaluated against the same ControlPrincipal / RoleBinding / global-or-Tenant scope model. They do not bypass the Control Plane authorization boundary.
+Raw global PriceRule rows, global PriceRule mutation and unfiltered/cross-Tenant financial reads require a global binding. A Tenant-scoped pricing read sees only that Tenant's owned rules rather than gateway-global rule rows.
 
 ## Control Plane authentication
 
@@ -133,15 +133,17 @@ Expired idempotency rows are purged opportunistically in bounded batches and exa
 
 Every Billing Control Plane mutation requires `Idempotency-Key`; it is not optional for financial writes.
 
+Missing, empty or oversized Billing mutation idempotency headers are authenticated mutation failures and produce `outcome=error` AuditEvents.
+
 The management idempotency layer protects the complete API mutation. Financial primitives may add a second domain key where needed.
 
-For `credit.grant`, the immutable Ledger idempotency key is scoped by:
+For `credit.grant`, the immutable Ledger idempotency identity is scoped by:
 
 ```text
-ControlPrincipal + billing.credit.grant + Tenant + management key
+ControlPrincipal + billing.credit.grant + Tenant + management key + semantic request fingerprint
 ```
 
-This prevents identical actor keys used in two Tenants from accidentally referring to one Ledger entry.
+The extra semantic fingerprint matters because the management idempotency row may expire and allow the same raw key to be reclaimed. A changed amount/reason after expiry must never resolve to an older Ledger credit while being audited as a new success.
 
 ## Audit trail
 
@@ -151,6 +153,7 @@ Audited actions include:
 
 - successful Control Plane mutations;
 - authenticated authorization denials;
+- mutation validation/idempotency errors after authentication;
 - mutation errors after rollback;
 - completed idempotent replays;
 - sensitive reads such as Credentials, RBAC, Audit, BillingAccount, PriceRule, Usage, Ledger and Reservation queries.
@@ -205,11 +208,12 @@ Tenant-scoped callers must query the matching Tenant. Global callers may query g
 - authorization happens before governed mutation.
 - Tenant scope cannot authorize another Tenant.
 - global-only operations require global authorization.
+- Billing permissions are evaluated by the same central RBAC core as non-Billing permissions.
 - Billing monetary/policy writes require owner/admin billing permissions.
 - operator/viewer cannot grant credits or change BillingAccount/Pricing state.
 - resource mutation, success AuditEvent and idempotency completion commit atomically.
 - failed durable transaction leaves no success AuditEvent/completed replay behind.
-- authenticated denials, idempotency rejections and completed replays create audit evidence.
+- authenticated denials, Billing idempotency-header rejections and completed replays create audit evidence.
 - Billing reads are auditable.
 - AuditEvent is append-only.
 - UsageEvent and LedgerEntry remain immutable regardless of Control Plane role.
