@@ -2,17 +2,23 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { SessionRecord, SessionStore } from "@agent-gateway/core";
 import type { GatewaySession } from "@agent-gateway/protocol";
+import { PostgresGatewayStore } from "@agent-gateway/storage-postgres";
 import type {
   BillingAccountRecord,
   ReservationRecord,
   UsageObservationInput,
 } from "@agent-gateway/billing-postgres";
 import {
+  BillingInsufficientFundsError,
+  BillingPricingUnavailableError,
   BillingSessionStore,
   DataPlaneBilling,
+  PostgresDataPlaneBillingStore,
   SessionBudgetRequiredError,
   type BillingRuntimeStore,
 } from "./index.js";
+
+const databaseUrl = process.env.DATABASE_URL;
 
 class MemorySessionStore implements SessionStore {
   readonly records = new Map<string, SessionRecord>();
@@ -215,4 +221,100 @@ test("data plane billing normalizes gateway session context into usage observati
     measuredAt: new Date(1_700_000_100 * 1000).toISOString(),
     sourceRef: "provider-session:agsess_1",
   });
+});
+
+test("postgres data plane billing fails closed on missing customer price and renews expired holds", { skip: !databaseUrl }, async () => {
+  const gateway = new PostgresGatewayStore(databaseUrl!);
+  const billing = new PostgresDataPlaneBillingStore(databaseUrl!, { reservationRenewalTtlSeconds: 60 });
+  await gateway.migrate();
+  await billing.migrate();
+
+  const suffix = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const setup = async (label: string, creditLimitMicros: bigint) => {
+    const tenantId = `tenant_dp_${label}_${suffix}`;
+    const projectId = `project_dp_${label}_${suffix}`;
+    const sessionId = `agsess_dp_${label}_${suffix}`;
+    await gateway.createTenant({ id: tenantId, name: `Data Plane ${label}` });
+    await gateway.createProject({ id: projectId, tenantId, name: `Data Plane ${label}` });
+    const now = new Date().toISOString();
+    await gateway.create({
+      id: sessionId,
+      tenantId,
+      projectId,
+      provider: "fake",
+      channelId: "fake-channel",
+      providerSessionId: `provider_${label}_${suffix}`,
+      state: "bound",
+      budget: { max_cost_micros: creditLimitMicros.toString() },
+      createdAt: now,
+      updatedAt: now,
+    });
+    await billing.upsertAccount({ tenantId, creditLimitMicros });
+    return { tenantId, projectId, sessionId };
+  };
+
+  const pricing = await setup("pricing", 2_000_000n);
+  const pricingReservation = await billing.reserve({
+    tenantId: pricing.tenantId,
+    projectId: pricing.projectId,
+    requestRef: `pricing:${suffix}`,
+    amountMicros: 2_000_000n,
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  await billing.attachReservation(pricingReservation.id, pricing.sessionId);
+  const observed = await billing.observeUsage({
+    tenantId: pricing.tenantId,
+    projectId: pricing.projectId,
+    sessionId: pricing.sessionId,
+    providerType: "fake",
+    channelId: "fake-channel",
+    model: "fake-model",
+    usage: { input_tokens: 100 },
+    measuredAt: new Date().toISOString(),
+    sourceRef: `pricing:${suffix}:usage`,
+  });
+  assert.equal(observed.events.length, 1);
+  await assert.rejects(
+    billing.assertSessionBudget(pricing.sessionId),
+    BillingPricingUnavailableError,
+  );
+
+  const renewal = await setup("renewal", 2_000_000n);
+  const expired = await billing.reserve({
+    tenantId: renewal.tenantId,
+    projectId: renewal.projectId,
+    requestRef: `renewal:${suffix}`,
+    amountMicros: 1_500_000n,
+    expiresAt: new Date(Date.now() - 1000).toISOString(),
+  });
+  await billing.attachReservation(expired.id, renewal.sessionId);
+  const renewedBudget = await billing.assertSessionBudget(renewal.sessionId);
+  assert.equal(renewedBudget.limited, true);
+  const renewed = await billing.getSessionReservation(renewal.sessionId);
+  assert(renewed);
+  assert.equal(new Date(renewed.expiresAt).getTime() > Date.now(), true);
+
+  const blocked = await setup("blocked", 2_000_000n);
+  const blockedExpired = await billing.reserve({
+    tenantId: blocked.tenantId,
+    projectId: blocked.projectId,
+    requestRef: `blocked-expired:${suffix}`,
+    amountMicros: 1_500_000n,
+    expiresAt: new Date(Date.now() - 1000).toISOString(),
+  });
+  await billing.attachReservation(blockedExpired.id, blocked.sessionId);
+  await billing.reserve({
+    tenantId: blocked.tenantId,
+    projectId: blocked.projectId,
+    requestRef: `blocked-other:${suffix}`,
+    amountMicros: 1_000_000n,
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  await assert.rejects(
+    billing.assertSessionBudget(blocked.sessionId),
+    BillingInsufficientFundsError,
+  );
+
+  await billing.close();
+  await gateway.close();
 });
