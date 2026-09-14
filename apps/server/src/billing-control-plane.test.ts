@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { PostgresBillingStore } from "@agent-gateway/billing-postgres";
 import { bootstrapActor, PostgresControlPlaneSecurity, type ControlPlaneActor } from "@agent-gateway/control-plane-auth";
+import { hasBillingPermission } from "@agent-gateway/control-plane-auth/billing";
 import { PostgresGatewayStore } from "@agent-gateway/storage-postgres";
-import { hasBillingPermission } from "./billing-control-plane.js";
 
 const databaseUrl = process.env.DATABASE_URL;
 
