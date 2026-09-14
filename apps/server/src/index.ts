@@ -39,6 +39,7 @@ import type {
   ProviderPlugin,
   SessionEventBatch,
 } from "@agent-gateway/protocol";
+import { createBillingControlPlaneHandler } from "./billing-control-plane.js";
 import { createControlPlaneHandler } from "./control-plane.js";
 
 interface GatewayConfig {
@@ -353,6 +354,17 @@ const controlPlaneHandler = persistence.database && persistence.controlSecurity
     credentialKeyring,
     moduleCatalog,
     reloadGateway,
+    bootstrapToken,
+    idempotencyPendingTtlSeconds,
+    idempotencyCompletedTtlSeconds,
+  })
+  : undefined;
+
+const billingControlPlaneHandler = persistence.billing && persistence.controlSecurity
+  ? createBillingControlPlaneHandler({
+    billing: persistence.billing,
+    security: persistence.controlSecurity,
+    credentialKeyring,
     bootstrapToken,
     idempotencyPendingTtlSeconds,
     idempotencyCompletedTtlSeconds,
@@ -688,6 +700,9 @@ http.createServer(async (req, res) => {
             message: "Control plane security requires DATABASE_URL",
           },
         }, { "x-request-id": `req_${randomUUID().replaceAll("-", "")}` });
+      }
+      if (billingControlPlaneHandler && path.startsWith("/api/gateway/admin/billing/")) {
+        if (await billingControlPlaneHandler(req, res, path)) return;
       }
       if (await controlPlaneHandler(req, res, path)) return;
     }
