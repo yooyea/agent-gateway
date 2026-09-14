@@ -3,82 +3,22 @@ import { randomUUID } from "node:crypto";
 import type { CredentialKeyring } from "@agent-gateway/credential-crypto";
 import {
   bootstrapActor,
+  ControlPlaneAuthorizationError,
   secureTokenEqual,
   type ControlPlaneActor,
-  type ControlPlaneRole,
   type PostgresControlPlaneSecurity,
 } from "@agent-gateway/control-plane-auth";
+import {
+  hasBillingPermission,
+  requireBillingPermission,
+  type BillingPermission,
+} from "@agent-gateway/control-plane-auth/billing";
 import {
   PostgresBillingStore,
   type LedgerBook,
   type UsageMetric,
 } from "@agent-gateway/billing-postgres";
 import { stableRequestHash } from "@agent-gateway/core";
-
-export type BillingPermission =
-  | "billing.accounts.read"
-  | "billing.accounts.write"
-  | "billing.pricing.read"
-  | "billing.pricing.write"
-  | "billing.credits.write"
-  | "billing.usage.read"
-  | "billing.ledger.read"
-  | "billing.reservations.read";
-
-const BILLING_ALL: ReadonlySet<BillingPermission> = new Set([
-  "billing.accounts.read",
-  "billing.accounts.write",
-  "billing.pricing.read",
-  "billing.pricing.write",
-  "billing.credits.write",
-  "billing.usage.read",
-  "billing.ledger.read",
-  "billing.reservations.read",
-]);
-
-const BILLING_READ: ReadonlySet<BillingPermission> = new Set([
-  "billing.accounts.read",
-  "billing.pricing.read",
-  "billing.usage.read",
-  "billing.ledger.read",
-  "billing.reservations.read",
-]);
-
-const ROLE_BILLING_PERMISSIONS: Record<ControlPlaneRole, ReadonlySet<BillingPermission>> = {
-  owner: BILLING_ALL,
-  admin: BILLING_ALL,
-  operator: BILLING_READ,
-  viewer: BILLING_READ,
-};
-
-export class BillingControlPlaneAuthorizationError extends Error {
-  constructor(readonly permission: BillingPermission, readonly tenantId?: string) {
-    super(`Control plane permission denied: ${permission}`);
-    this.name = "BillingControlPlaneAuthorizationError";
-  }
-}
-
-export function hasBillingPermission(
-  actor: ControlPlaneActor,
-  permission: BillingPermission,
-  tenantId?: string,
-) {
-  return actor.bindings.some((binding) => {
-    if (!ROLE_BILLING_PERMISSIONS[binding.role].has(permission)) return false;
-    if (binding.scopeType === "global") return true;
-    return Boolean(tenantId && binding.scopeType === "tenant" && binding.scopeId === tenantId);
-  });
-}
-
-function requireBillingPermission(
-  actor: ControlPlaneActor,
-  permission: BillingPermission,
-  tenantId?: string,
-) {
-  if (!hasBillingPermission(actor, permission, tenantId)) {
-    throw new BillingControlPlaneAuthorizationError(permission, tenantId);
-  }
-}
 
 export interface BillingControlPlaneDependencies {
   billing: PostgresBillingStore;
@@ -126,7 +66,7 @@ function json(
 }
 
 function errorStatus(error: unknown) {
-  if (error instanceof BillingControlPlaneAuthorizationError) return 403;
+  if (error instanceof ControlPlaneAuthorizationError) return 403;
   const message = error instanceof Error ? error.message : String(error);
   if (/Invalid control plane token/.test(message)) return 401;
   if (/idempotency request is still in progress|idempotency key was already used/.test(message)) return 409;
@@ -195,7 +135,6 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
     idempotencyCompletedTtlSeconds,
   } = deps;
 
-  // Route billing queries through the same transaction client as Audit/idempotency.
   security.attachTransactionalPool(billing.pool);
 
   async function authenticate(req: http.IncomingMessage): Promise<ControlPlaneActor> {
@@ -271,15 +210,18 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
     resultResourceId?: (result: T) => string | undefined;
   }) {
     await authorize(input);
-    const raw = input.req.headers["idempotency-key"];
-    const key = typeof raw === "string" ? raw.trim() : "";
-    if (!key) throw new Error("Idempotency-Key is required for billing mutations");
-    if (key.length > 256) throw new Error("Idempotency-Key must be at most 256 characters");
 
-    const requestHash = stableRequestHash(input.request);
-    const context = idemContext(input.actor.id, input.action, key);
+    let key = "";
+    let requestHash = "";
     let claimed = false;
     try {
+      const raw = input.req.headers["idempotency-key"];
+      key = typeof raw === "string" ? raw.trim() : "";
+      if (!key) throw new Error("Idempotency-Key is required for billing mutations");
+      if (key.length > 256) throw new Error("Idempotency-Key must be at most 256 characters");
+
+      requestHash = stableRequestHash(input.request);
+      const context = idemContext(input.actor.id, input.action, key);
       const claim = await security.claimControlIdempotency({
         actorId: input.actor.id,
         scope: input.action,
@@ -469,7 +411,11 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
         const body = await auditedRead({
           actor, requestId: rid, permission: "billing.pricing.read",
           action: "billing.price_rule.list", resourceType: "price_rule", tenantId,
-          run: () => billing.listPriceRules(tenantId),
+          run: async () => {
+            const rows = await billing.listPriceRules(tenantId);
+            if (!tenantId || hasBillingPermission(actor, "billing.pricing.read")) return rows;
+            return rows.filter((row) => row.tenantId === tenantId);
+          },
         });
         json(res, 200, body, rid);
         return true;
@@ -524,6 +470,7 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
         if (!tenantId) throw new Error("tenant_id is required");
         const amountMicros = positiveIntegerString(request.amount_micros, "amount_micros");
         const reason = optionalString(request.reason);
+        const creditFingerprint = stableRequestHash({ tenantId, amountMicros, reason });
         const result = await mutation({
           req, actor, requestId: rid, permission: "billing.credits.write",
           action: "billing.credit.grant", resourceType: "ledger_entry", tenantId,
@@ -531,7 +478,7 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
           run: (key) => billing.grantCredit({
             tenantId,
             amountMicros,
-            idempotencyKey: `control:${actor.id}:billing.credit.grant:${tenantId}:${key}`,
+            idempotencyKey: `control:${actor.id}:billing.credit.grant:${tenantId}:${key}:${creditFingerprint}`,
             metadata: { reason, actor_id: actor.id, request_id: rid },
           }),
           resultResourceId: (value: any) => value?.id,
