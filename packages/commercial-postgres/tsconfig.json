@@ -10,5 +10,8 @@
     "rootDir": "src",
     "skipLibCheck": true
   },
+  "references": [
+    {"path":"../storage-postgres"}
+  ],
   "include": ["src/**/*.ts"]
 }
