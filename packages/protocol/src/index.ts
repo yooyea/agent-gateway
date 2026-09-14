@@ -42,7 +42,13 @@ export interface AgentDefinition {
 }
 
 export interface SessionBudget {
+  /**
+   * Legacy numeric representation retained for internal/backward compatibility.
+   * New northbound max-cost headers are normalized directly into max_cost_micros so
+   * financial limits never pass through JavaScript floating-point arithmetic.
+   */
   max_cost_usd?: number;
+  max_cost_micros?: string;
   max_duration_seconds?: number;
   max_iterations?: number;
   max_subagents?: number;

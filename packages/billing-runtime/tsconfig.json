@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "declaration": true,
+    "composite": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "skipLibCheck": true
+  },
+  "references": [
+    {"path":"../protocol"},
+    {"path":"../core"},
+    {"path":"../billing-postgres"},
+    {"path":"../storage-postgres"}
+  ],
+  "include": ["src/**/*.ts"]
+}

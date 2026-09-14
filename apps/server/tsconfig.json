@@ -17,7 +17,9 @@
     {"path":"../../packages/provider-openai-agents"},
     {"path":"../../packages/provider-mock"},
     {"path":"../../packages/runtime-redis"},
-    {"path":"../../packages/storage-postgres"}
+    {"path":"../../packages/storage-postgres"},
+    {"path":"../../packages/billing-postgres"},
+    {"path":"../../packages/billing-runtime"}
   ],
   "include": ["src/**/*.ts"]
 }

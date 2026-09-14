@@ -7,7 +7,7 @@
   "scripts": {
     "build": "tsc -b",
     "check": "tsc -b --pretty false",
-    "test": "npm run build && node --test packages/core/dist/index.test.js packages/credential-crypto/dist/index.test.js packages/control-plane-auth/dist/index.test.js packages/storage-postgres/dist/index.test.js packages/runtime-redis/dist/index.test.js packages/billing-postgres/dist/index.test.js",
+    "test": "npm run build && node --test --test-concurrency=1 packages/core/dist/index.test.js packages/credential-crypto/dist/index.test.js packages/control-plane-auth/dist/index.test.js packages/storage-postgres/dist/index.test.js packages/runtime-redis/dist/index.test.js packages/billing-postgres/dist/index.test.js packages/billing-runtime/dist/index.test.js",
     "dev": "npm run build && node apps/server/dist/index.js",
     "start": "node apps/server/dist/index.js"
   },

@@ -11,6 +11,7 @@
     {"path":"packages/storage-postgres"},
     {"path":"packages/runtime-redis"},
     {"path":"packages/billing-postgres"},
+    {"path":"packages/billing-runtime"},
     {"path":"apps/server"}
   ]
 }

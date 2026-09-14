@@ -18,6 +18,16 @@ import {
   type SessionStore,
   type VirtualKeyRecord,
 } from "@agent-gateway/core";
+import {
+  BillingInsufficientFundsError,
+  BillingPricingUnavailableError,
+  BillingSessionStore,
+  DataPlaneBilling,
+  PostgresDataPlaneBillingStore,
+  SessionBudgetExceededError,
+  SessionBudgetRequiredError,
+  usdToMicros,
+} from "@agent-gateway/billing-runtime";
 import { PostgresControlPlaneSecurity } from "@agent-gateway/control-plane-auth";
 import { CredentialKeyring, credentialContext } from "@agent-gateway/credential-crypto";
 import { RedisRuntimeControls } from "@agent-gateway/runtime-redis";
@@ -25,6 +35,7 @@ import { PostgresGatewayStore, type RuntimeChannelRecord } from "@agent-gateway/
 import type {
   AgentCapability,
   CreateSessionRequest,
+  GatewaySession,
   ProviderPlugin,
   SessionEventBatch,
 } from "@agent-gateway/protocol";
@@ -110,6 +121,7 @@ async function createPersistence(): Promise<{
   authenticator: GatewayAuthenticator;
   database?: PostgresGatewayStore;
   controlSecurity?: PostgresControlPlaneSecurity;
+  billing?: PostgresDataPlaneBillingStore;
 }> {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
@@ -123,9 +135,13 @@ async function createPersistence(): Promise<{
 
   const store = new PostgresGatewayStore(databaseUrl);
   const controlSecurity = new PostgresControlPlaneSecurity(databaseUrl);
-  // A Control Plane transaction may mutate resources through PostgresGatewayStore and
-  // append Audit/Idempotency records through PostgresControlPlaneSecurity. Route both
-  // repository query paths through the same transaction client.
+  const reservationTtlSeconds = envPositiveInteger(
+    "AGENT_GATEWAY_SESSION_RESERVATION_TTL_SECONDS",
+    86_400,
+  );
+  const billing = new PostgresDataPlaneBillingStore(databaseUrl, {
+    reservationRenewalTtlSeconds: reservationTtlSeconds,
+  });
   controlSecurity.attachTransactionalPool(store.pool);
 
   const autoMigrate = process.env.AGENT_GATEWAY_AUTO_MIGRATE === "true" ||
@@ -133,6 +149,7 @@ async function createPersistence(): Promise<{
   if (autoMigrate) {
     await store.migrate();
     await controlSecurity.migrate();
+    await billing.migrate();
   }
   if (process.env.AGENT_GATEWAY_DEV_BOOTSTRAP === "true") {
     if (process.env.NODE_ENV === "production") {
@@ -151,6 +168,7 @@ async function createPersistence(): Promise<{
     authenticator: new StoreBackedVirtualKeyAuthenticator(store),
     database: store,
     controlSecurity,
+    billing,
   };
 }
 
@@ -198,9 +216,20 @@ const persistence = await createPersistence();
 const runtimeControls = await createRuntimeControls();
 const credentialKeyring = createCredentialKeyring();
 const sessionCacheTtlSeconds = envPositiveInteger("AGENT_GATEWAY_SESSION_CACHE_TTL_SECONDS", 300);
-const sessions = runtimeControls
-  ? runtimeControls.createCachedSessionStore(persistence.sessions, sessionCacheTtlSeconds)
+const sessionReservationTtlSeconds = envPositiveInteger(
+  "AGENT_GATEWAY_SESSION_RESERVATION_TTL_SECONDS",
+  86_400,
+);
+const billingSessions = persistence.billing
+  ? new BillingSessionStore(persistence.sessions, persistence.billing, {
+    reservationTtlSeconds: sessionReservationTtlSeconds,
+    requireBudgetForBilledTenant: true,
+  })
   : persistence.sessions;
+const sessions = runtimeControls
+  ? runtimeControls.createCachedSessionStore(billingSessions, sessionCacheTtlSeconds)
+  : billingSessions;
+const dataPlaneBilling = persistence.billing ? new DataPlaneBilling(persistence.billing) : undefined;
 const moduleCatalog = providerModules();
 const defaultProvider = process.env.DEFAULT_PROVIDER?.trim() || undefined;
 
@@ -347,8 +376,13 @@ function json(
 }
 
 function errorStatus(error: unknown) {
+  if (error instanceof BillingInsufficientFundsError) return 402;
+  if (error instanceof SessionBudgetRequiredError) return 402;
+  if (error instanceof SessionBudgetExceededError) return 429;
+  if (error instanceof BillingPricingUnavailableError) return 503;
   if (error instanceof GatewayAdmissionError) return 429;
   const message = error instanceof Error ? error.message : String(error);
+  if (/Billing account disabled/.test(message)) return 402;
   if (/Missing bearer token|Invalid API key/.test(message)) return 401;
   if (/Session not found|Provider not found|Credential not found|Channel not found/.test(message)) return 404;
   if (/Session is not bound|Idempotency request is still in progress|Idempotency key was already used/.test(message)) return 409;
@@ -359,6 +393,37 @@ function errorStatus(error: unknown) {
   return 500;
 }
 
+function errorHeaders(error: unknown) {
+  if (error instanceof GatewayAdmissionError) return error.headers;
+  if (error instanceof BillingInsufficientFundsError) {
+    return {
+      "x-agent-gateway-limit-type": "billing_capacity",
+      "x-agent-gateway-available-micros": error.availableMicros.toString(),
+      "x-agent-gateway-requested-micros": error.requestedMicros.toString(),
+    };
+  }
+  if (error instanceof SessionBudgetRequiredError) {
+    return { "x-agent-gateway-limit-type": "budget_required" };
+  }
+  if (error instanceof SessionBudgetExceededError) {
+    return {
+      "x-agent-gateway-limit-type": "budget",
+      "x-agent-gateway-budget-remaining-micros": error.remainingMicros.toString(),
+    };
+  }
+  if (error instanceof BillingPricingUnavailableError) {
+    return {
+      "x-agent-gateway-limit-type": "billing_price_unavailable",
+      ...(error.usageEventId ? { "x-agent-gateway-usage-event-id": error.usageEventId } : {}),
+    };
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  if (/Billing account disabled/.test(message)) {
+    return { "x-agent-gateway-limit-type": "billing_disabled" };
+  }
+  return {} as Record<string, string>;
+}
+
 function routeHints(req: http.IncomingMessage): RouteHints {
   const provider = req.headers["x-agent-gateway-provider"];
   const channel = req.headers["x-agent-gateway-channel"];
@@ -367,12 +432,25 @@ function routeHints(req: http.IncomingMessage): RouteHints {
   const requiredCapabilities = typeof capabilityHeader === "string"
     ? capabilityHeader.split(",").map((item) => item.trim()).filter(Boolean) as AgentCapability[]
     : undefined;
-  const maxCostUsd = typeof maxCostHeader === "string" ? Number(maxCostHeader) : undefined;
+
+  let maxCostMicros: string | undefined;
+  if (typeof maxCostHeader === "string") {
+    const raw = maxCostHeader.trim();
+    if (!/^\d+(?:\.\d{1,6})?$/.test(raw)) {
+      throw new Error("X-Agent-Gateway-Max-Cost-USD must be a positive decimal with at most 6 fractional digits");
+    }
+    const micros = usdToMicros(raw);
+    if (micros <= 0n) {
+      throw new Error("X-Agent-Gateway-Max-Cost-USD must be greater than zero");
+    }
+    maxCostMicros = micros.toString();
+  }
+
   return {
     provider: typeof provider === "string" ? provider : undefined,
     channel: typeof channel === "string" ? channel : undefined,
     requiredCapabilities,
-    budget: Number.isFinite(maxCostUsd) ? { max_cost_usd: maxCostUsd } : undefined,
+    budget: maxCostMicros === undefined ? undefined : { max_cost_micros: maxCostMicros },
   };
 }
 
@@ -402,18 +480,23 @@ async function enforceRateLimit(context: GatewayRequestContext) {
   return headers;
 }
 
-async function withConcurrency<T>(context: GatewayRequestContext, run: () => Promise<T>): Promise<T> {
-  if (!runtimeControls) return run();
+async function withLease<T>(input: {
+  key: string;
+  limit: number;
+  limitType: string;
+  run: () => Promise<T>;
+}): Promise<T> {
+  if (!runtimeControls) return input.run();
   const decision = await runtimeControls.acquireConcurrency({
-    key: runtimeIdentity(context),
-    limit: maxConcurrency,
+    key: input.key,
+    limit: input.limit,
     ttlSeconds: concurrencyLeaseSeconds,
   });
   if (!decision.acquired) {
     throw new GatewayAdmissionError("Concurrency limit exceeded", {
       "retry-after": String(decision.retryAfterSeconds),
-      "x-agent-gateway-limit-type": "concurrency",
-      "x-agent-gateway-concurrency-limit": String(maxConcurrency),
+      "x-agent-gateway-limit-type": input.limitType,
+      "x-agent-gateway-concurrency-limit": String(input.limit),
     });
   }
   const heartbeatMs = Math.max(1000, Math.floor((concurrencyLeaseSeconds * 1000) / 3));
@@ -422,11 +505,52 @@ async function withConcurrency<T>(context: GatewayRequestContext, run: () => Pro
   }, heartbeatMs);
   heartbeat.unref();
   try {
-    return await run();
+    return await input.run();
   } finally {
     clearInterval(heartbeat);
     await runtimeControls.releaseConcurrency(decision.lease).catch(() => undefined);
   }
+}
+
+function withConcurrency<T>(context: GatewayRequestContext, run: () => Promise<T>) {
+  return withLease({
+    key: runtimeIdentity(context),
+    limit: maxConcurrency,
+    limitType: "concurrency",
+    run,
+  });
+}
+
+function withSessionConcurrency<T>(sessionId: string, run: () => Promise<T>) {
+  return withLease({
+    key: `session:${sessionId}`,
+    limit: 1,
+    limitType: "session_concurrency",
+    run,
+  });
+}
+
+async function releaseDataPlaneIdempotency(input: {
+  context: GatewayRequestContext;
+  scope: string;
+  key: string;
+  requestHash: string;
+}) {
+  if (!persistence.database || !input.context.virtualKeyId) return;
+  await persistence.database.pool.query(
+    `DELETE FROM gateway_idempotency
+     WHERE tenant_id=$1 AND virtual_key_id=$2 AND scope=$3 AND idempotency_key=$4
+       AND request_hash=$5 AND state='pending'`,
+    [input.context.tenantId, input.context.virtualKeyId, input.scope, input.key, input.requestHash],
+  );
+}
+
+function knownPreProviderFailure(error: unknown) {
+  if (error instanceof BillingInsufficientFundsError) return true;
+  if (error instanceof SessionBudgetRequiredError) return true;
+  if (error instanceof GatewayAdmissionError) return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /Billing account disabled/.test(message);
 }
 
 async function executeIdempotent<T>(input: {
@@ -442,12 +566,13 @@ async function executeIdempotent<T>(input: {
   if (key.length > 256) throw new Error("Idempotency-Key must be at most 256 characters");
   if (!input.context.virtualKeyId) throw new Error("Virtual key identity is required for idempotency");
 
+  const requestHash = stableRequestHash(input.request);
   const claim = await persistence.idempotency.claim({
     tenantId: input.context.tenantId,
     virtualKeyId: input.context.virtualKeyId,
     scope: input.scope,
     key,
-    requestHash: stableRequestHash(input.request),
+    requestHash,
     expiresAt: new Date(Date.now() + idempotencyPendingTtlSeconds * 1000).toISOString(),
   });
   if (claim.state === "conflict") {
@@ -458,7 +583,21 @@ async function executeIdempotent<T>(input: {
     return { status: claim.responseStatus, body: claim.responseBody as T, replay: true };
   }
 
-  const result = await input.run();
+  let result: { status: number; body: T };
+  try {
+    result = await input.run();
+  } catch (error) {
+    if (knownPreProviderFailure(error)) {
+      await releaseDataPlaneIdempotency({
+        context: input.context,
+        scope: input.scope,
+        key,
+        requestHash,
+      }).catch(() => undefined);
+    }
+    throw error;
+  }
+
   await persistence.idempotency.complete({
     tenantId: input.context.tenantId,
     virtualKeyId: input.context.virtualKeyId,
@@ -469,6 +608,56 @@ async function executeIdempotent<T>(input: {
     expiresAt: new Date(Date.now() + idempotencyCompletedTtlSeconds * 1000).toISOString(),
   });
   return { ...result, replay: false };
+}
+
+async function scopedSessionContext(sessionId: string, context: GatewayRequestContext) {
+  const record = await sessions.get(sessionId);
+  if (!record || record.tenantId !== context.tenantId) throw new Error(`Session not found: ${sessionId}`);
+  if (context.projectId && record.projectId !== context.projectId) {
+    throw new Error(`Session not found: ${sessionId}`);
+  }
+  return {
+    ...context,
+    projectId: record.projectId ?? context.projectId,
+  };
+}
+
+async function observeSessionUsage(
+  session: GatewaySession,
+  context: GatewayRequestContext,
+  modelHint?: string,
+) {
+  if (!dataPlaneBilling) return;
+  await dataPlaneBilling.observeSession(session, context, { modelHint });
+}
+
+async function observeSessionUsageBestEffort(
+  session: GatewaySession,
+  context: GatewayRequestContext,
+  modelHint?: string,
+) {
+  try {
+    await observeSessionUsage(session, context, modelHint);
+  } catch (error) {
+    console.error("data-plane usage observation failed", error);
+  }
+}
+
+async function assertBudgetBeforeProviderWork(sessionId: string, context: GatewayRequestContext) {
+  if (!dataPlaneBilling) return;
+  const snapshot = await gateway.getSession(sessionId, context);
+  await observeSessionUsage(snapshot, context);
+  await dataPlaneBilling.assertSessionBudget(sessionId);
+}
+
+async function reconcileSessionUsageBestEffort(sessionId: string, context: GatewayRequestContext) {
+  if (!dataPlaneBilling) return;
+  try {
+    const snapshot = await gateway.getSession(sessionId, context);
+    await observeSessionUsage(snapshot, context);
+  } catch (error) {
+    console.error("data-plane usage reconciliation failed", error);
+  }
 }
 
 http.createServer(async (req, res) => {
@@ -485,6 +674,7 @@ http.createServer(async (req, res) => {
         service: "agent-gateway",
         persistence: database ? "postgres" : "memory",
         runtime: redis ? "redis" : "disabled",
+        billing: persistence.billing ? "postgres" : "disabled",
         database,
         redis,
       });
@@ -525,10 +715,14 @@ http.createServer(async (req, res) => {
         context,
         scope: "agents.sessions.create",
         request: { body, hints },
-        run: async () => ({
-          status: 201,
-          body: await withConcurrency(context, () => gateway.createSession(body, context, hints)),
-        }),
+        run: async () => {
+          const session = await withConcurrency(
+            context,
+            () => gateway.createSession(body, context, hints),
+          );
+          await observeSessionUsageBestEffort(session, context, body.agent?.model);
+          return { status: 201, body: session };
+        },
       });
       return json(res, result.status, result.body, {
         ...rateHeaders,
@@ -538,35 +732,49 @@ http.createServer(async (req, res) => {
 
     let match = path.match(/^\/agents\/sessions\/([^/]+)$/);
     if (req.method === "GET" && match) {
+      const sessionId = decodeURIComponent(match[1]);
+      const sessionContext = await scopedSessionContext(sessionId, context);
       const session = await withConcurrency(
-        context,
-        () => gateway.getSession(decodeURIComponent(match![1]), context),
+        sessionContext,
+        () => gateway.getSession(sessionId, sessionContext),
       );
+      await observeSessionUsageBestEffort(session, sessionContext);
       return json(res, 200, session, rateHeaders);
     }
 
     match = path.match(/^\/agents\/sessions\/([^/]+)\/events$/);
     if (req.method === "POST" && match) {
       const sessionId = decodeURIComponent(match[1]);
+      const sessionContext = await scopedSessionContext(sessionId, context);
       const events = (await readJson(req)) as SessionEventBatch;
-      await withConcurrency(context, () => gateway.sendEvents(sessionId, events, context));
+      await withConcurrency(sessionContext, () => withSessionConcurrency(sessionId, async () => {
+        await assertBudgetBeforeProviderWork(sessionId, sessionContext);
+        await gateway.sendEvents(sessionId, events, sessionContext);
+        await reconcileSessionUsageBestEffort(sessionId, sessionContext);
+      }));
       res.writeHead(204, rateHeaders);
       return res.end();
     }
 
     if (req.method === "GET" && match) {
       const sessionId = decodeURIComponent(match[1]);
-      await withConcurrency(context, async () => {
-        const stream = await gateway.streamEvents(sessionId, context);
+      const sessionContext = await scopedSessionContext(sessionId, context);
+      await withConcurrency(sessionContext, () => withSessionConcurrency(sessionId, async () => {
+        await assertBudgetBeforeProviderWork(sessionId, sessionContext);
+        const stream = await gateway.streamEvents(sessionId, sessionContext);
         res.writeHead(200, {
           "content-type": "text/event-stream; charset=utf-8",
           "cache-control": "no-cache",
           connection: "keep-alive",
           ...rateHeaders,
         });
-        for await (const chunk of stream) res.write(chunk);
-        res.end();
-      });
+        try {
+          for await (const chunk of stream) res.write(chunk);
+          res.end();
+        } finally {
+          await reconcileSessionUsageBestEffort(sessionId, sessionContext);
+        }
+      }));
       return;
     }
 
@@ -577,7 +785,11 @@ http.createServer(async (req, res) => {
       return;
     }
     const message = error instanceof Error ? error.message : String(error);
-    const headers = error instanceof GatewayAdmissionError ? error.headers : {};
-    return json(res, errorStatus(error), { error: { type: "gateway_error", message } }, headers);
+    return json(
+      res,
+      errorStatus(error),
+      { error: { type: "gateway_error", message } },
+      errorHeaders(error),
+    );
   }
 }).listen(port, () => console.log(`agent-gateway listening on :${port}`));
