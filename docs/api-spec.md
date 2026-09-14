@@ -82,8 +82,9 @@ X-Agent-Gateway-Max-Cost-USD: 2.00
 
 - must be greater than zero,
 - accepts at most six decimal places,
-- becomes `SessionBudget.max_cost_usd`,
-- participates in the create-session idempotency fingerprint.
+- is converted directly from decimal text to integer USD micros without JavaScript floating-point arithmetic,
+- is persisted internally as exact `SessionBudget.max_cost_micros`,
+- participates in the create-session idempotency fingerprint in that exact representation.
 
 Current billing activation rule:
 
@@ -99,14 +100,14 @@ The gateway performs:
 select Channel
   -> allocate agsess_...
   -> persist SessionBinding(state=creating)
-  -> if billed: reserve max-cost capacity and attach Reservation
+  -> if billed: reserve exact max-cost capacity and attach Reservation
   -> call upstream Provider Session create
   -> persist bound | failed
 ```
 
-If billing admission fails, the upstream Provider is not called.
+If billing admission fails, the upstream Provider is not called and any reservation created during that pre-provider admission path may be released safely.
 
-If Provider creation fails after reservation, the Session becomes `failed` and the active Reservation is released best-effort.
+Once Provider invocation begins, the gateway treats a generic provider/binding failure as potentially side-effecting. It does not release the financial hold merely because the local binding later reports failure; the Reservation remains until explicit reconciliation or expiry/renewal handling. This prevents an upstream Session that may already exist from becoming unreserved.
 
 Response preserves provider-native fields but rewrites public routing identity:
 
@@ -164,15 +165,20 @@ Example body:
 }
 ```
 
-For a billed Session, before forwarding additional Agent work the gateway performs a strict financial preflight:
+For a billed Session, before forwarding additional Agent work the gateway performs a strict financial preflight while holding an exclusive per-Session runtime lease:
 
 ```text
-retrieve provider Session
+acquire per-Session lease
+  -> retrieve provider Session
   -> observe cumulative usage
   -> settle usage delta
+  -> fail closed if customer pricing is unresolved
+  -> renew/reacquire expired Reservation capacity when necessary
   -> assert remaining SessionBudget
   -> only then POST events upstream
 ```
+
+The per-Session lease serializes budget admission and provider work so overlapping requests cannot both pass the same remaining budget snapshot.
 
 After successful upstream submission, usage reconciliation is best-effort. A post-success accounting refresh failure is not returned as a false mutation failure; the next expensive operation repeats strict preflight and catches up from cumulative usage.
 
@@ -186,7 +192,7 @@ Authorization: Bearer ag_...
 Accept: text/event-stream
 ```
 
-The gateway performs the same strict usage-refresh + budget preflight before opening the stream and streams from the original bound Channel.
+The gateway performs the same exclusive per-Session lease plus strict usage-refresh/budget preflight before opening the stream and streams from the original bound Channel.
 
 After stream completion it best-effort retrieves the provider Session and reconciles cumulative usage.
 
@@ -217,6 +223,16 @@ HTTP/1.1 402 Payment Required
 X-Agent-Gateway-Limit-Type: billing_disabled
 ```
 
+### Customer price unavailable for observed billed usage
+
+```http
+HTTP/1.1 503 Service Unavailable
+X-Agent-Gateway-Limit-Type: billing_price_unavailable
+X-Agent-Gateway-Usage-Event-Id: agusg_...
+```
+
+The gateway fails closed instead of admitting more work against a budget whose customer charge cannot yet be determined.
+
 ### Session budget exhausted
 
 ```http
@@ -226,6 +242,8 @@ X-Agent-Gateway-Budget-Remaining-Micros: 0
 ```
 
 Budget/capacity rejection occurs before new provider work.
+
+Reservation expiry is an operational lease boundary, not an implicit Session lifetime. If a live Session still has unused budget, the gateway renews/reacquires the remaining Reservation amount under the BillingAccount lock. If that capacity was consumed elsewhere while the hold was expired, renewal fails with normal billing-capacity rejection.
 
 ## 8. Runtime Channel view
 
@@ -380,7 +398,7 @@ Expected HTTP classes:
 - `404`: scoped resource not found, including cross-Tenant/cross-Project Session access
 - `409`: idempotency, binding-state, duplicate, FK/ownership or state conflict
 - `429`: rate/concurrency/session-budget admission failure
-- `502/503`: upstream Provider/Channel or required infrastructure unavailable
+- `502/503`: upstream Provider/Channel, unresolved required pricing, or required infrastructure unavailable
 
 Provider-native errors may be retained in protected traces/audit data, but secret-bearing upstream details must not be leaked blindly.
 
@@ -394,7 +412,7 @@ HTTP `Idempotency-Key` is scoped by:
 Tenant + VirtualKey + operation + Idempotency-Key
 ```
 
-The fingerprint includes body, routing hints, capability hints and Session budget hint.
+The fingerprint includes body, routing hints, capability hints and the exact normalized Session budget micros.
 
 Outcomes:
 
@@ -404,9 +422,9 @@ Outcomes:
 - completed key: replay original response
 - expired key: may be claimed again
 
-If execution fails before a successful upstream side effect, the Postgres pending claim is released so a corrected retry need not wait for pending TTL expiry.
+A pending claim is released only for failures known to happen before Provider invocation, such as billing-capacity/budget-required admission rejection or a gateway concurrency rejection. Once Provider invocation may have begun, an error is treated as potentially side-effecting and the claim remains pending until TTL/reconciliation; immediate retry is intentionally blocked to avoid duplicate Agent Sessions and duplicate spend.
 
-If upstream work succeeded but durable idempotency completion fails, the claim is deliberately not released; allowing immediate replay could duplicate provider work.
+If upstream work succeeded but durable idempotency completion fails, the claim is deliberately not released for the same reason.
 
 ### Control Plane mutations
 
