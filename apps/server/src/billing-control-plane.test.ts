@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
+import http from "node:http";
 import test from "node:test";
 import { PostgresBillingStore } from "@agent-gateway/billing-postgres";
 import { bootstrapActor, PostgresControlPlaneSecurity, type ControlPlaneActor } from "@agent-gateway/control-plane-auth";
 import { hasBillingPermission } from "@agent-gateway/control-plane-auth/billing";
+import { CredentialKeyring } from "@agent-gateway/credential-crypto";
 import { PostgresGatewayStore } from "@agent-gateway/storage-postgres";
+import { createBillingControlPlaneHandler } from "./billing-control-plane.js";
 
 const databaseUrl = process.env.DATABASE_URL;
+const TEST_KEY = "YWdlbnQtZ2F0ZXdheS1kZXYta2V5LTMyLWJ5dGVzISE=";
 
 function actor(role: "owner" | "admin" | "operator" | "viewer", scope: "global" | "tenant", scopeId?: string): ControlPlaneActor {
   return {
@@ -120,4 +124,65 @@ test("billing mutation and success AuditEvent commit and roll back atomically", 
   await security.close();
   await billing.close();
   await gateway.close();
+});
+
+test("billing mutation idempotency-header rejection is audited", { skip: !databaseUrl }, async () => {
+  const gateway = new PostgresGatewayStore(databaseUrl!);
+  const billing = new PostgresBillingStore(databaseUrl!);
+  const security = new PostgresControlPlaneSecurity(databaseUrl!);
+  const keyring = new CredentialKeyring({ test: TEST_KEY }, "test");
+  security.attachTransactionalPool(billing.pool);
+
+  await gateway.migrate();
+  await billing.migrate();
+  await security.migrate();
+
+  const suffix = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const tenantId = `tenant_billing_idem_audit_${suffix}`;
+  await gateway.createTenant({ id: tenantId, name: "Billing idempotency audit" });
+
+  const handler = createBillingControlPlaneHandler({
+    billing,
+    security,
+    credentialKeyring: keyring,
+    bootstrapToken: "billing-bootstrap-test",
+    idempotencyPendingTtlSeconds: 60,
+    idempotencyCompletedTtlSeconds: 600,
+  });
+  const server = http.createServer(async (req, res) => {
+    const path = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`).pathname;
+    if (!(await handler(req, res, path))) {
+      res.writeHead(404).end();
+    }
+  });
+
+  try {
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server did not bind a TCP port");
+
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/gateway/admin/billing/accounts/${tenantId}`, {
+      method: "PUT",
+      headers: {
+        authorization: "Bearer billing-bootstrap-test",
+        "content-type": "application/json",
+        "x-request-id": `req_billing_idem_audit_${suffix}`,
+      },
+      body: JSON.stringify({ credit_limit_micros: "1000000", enabled: true }),
+    });
+    assert.equal(response.status, 400);
+    assert.match(await response.text(), /Idempotency-Key is required/);
+    assert.equal(await billing.getAccount(tenantId), undefined);
+
+    const audit = await security.listAudit({ resourceId: tenantId });
+    assert.equal(audit.length, 1);
+    assert.equal(audit[0]?.outcome, "error");
+    assert.equal(audit[0]?.action, "billing.account.upsert");
+    assert.equal(audit[0]?.requestId, `req_billing_idem_audit_${suffix}`);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await security.close();
+    await billing.close();
+    await gateway.close();
+  }
 });
