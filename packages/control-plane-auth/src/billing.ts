@@ -5,8 +5,7 @@ import {
   type ControlPlaneRole,
 } from "./index.js";
 
-export type BillingPermission = Extract<
-  ControlPlanePermission,
+export type BillingPermission =
   | "billing.accounts.read"
   | "billing.accounts.write"
   | "billing.pricing.read"
@@ -14,8 +13,7 @@ export type BillingPermission = Extract<
   | "billing.credits.write"
   | "billing.usage.read"
   | "billing.ledger.read"
-  | "billing.reservations.read"
->;
+  | "billing.reservations.read";
 
 const BILLING_ALL: ReadonlySet<BillingPermission> = new Set([
   "billing.accounts.read",
@@ -63,7 +61,7 @@ export function requireBillingPermission(
   if (!hasBillingPermission(actor, permission, tenantId)) {
     throw new ControlPlaneAuthorizationError(
       `Control plane permission denied: ${permission}`,
-      permission,
+      permission as unknown as ControlPlanePermission,
       tenantId,
     );
   }
