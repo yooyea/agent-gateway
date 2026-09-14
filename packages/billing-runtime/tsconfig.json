@@ -13,7 +13,8 @@
   "references": [
     {"path":"../protocol"},
     {"path":"../core"},
-    {"path":"../billing-postgres"}
+    {"path":"../billing-postgres"},
+    {"path":"../storage-postgres"}
   ],
   "include": ["src/**/*.ts"]
 }
