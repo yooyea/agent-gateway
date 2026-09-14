@@ -68,6 +68,20 @@ function reservationExpiry(record: SessionRecord, fallbackSeconds: number) {
   return new Date(Date.now() + seconds * 1000).toISOString();
 }
 
+function budgetMicros(record: SessionRecord) {
+  const exact = record.budget?.max_cost_micros;
+  if (typeof exact === "string" && /^\d+$/.test(exact)) {
+    const value = BigInt(exact);
+    if (value > 0n) return value;
+  }
+
+  const legacy = record.budget?.max_cost_usd;
+  if (typeof legacy === "number" && Number.isFinite(legacy) && legacy > 0) {
+    return usdToMicros(String(legacy));
+  }
+  return undefined;
+}
+
 /**
  * Postgres Data Plane adapter adds hot-path invariants that are intentionally stricter
  * than generic accounting storage: billed usage must have an explicit customer price,
@@ -112,8 +126,6 @@ export class PostgresDataPlaneBillingStore extends PostgresBillingStore {
       if (!identity.rows[0]) return;
       const tenantId = String(identity.rows[0].tenant_id);
 
-      // Match normal Reservation admission lock order: BillingAccount first, then
-      // Reservation. This prevents renewal from racing a new Session for the same capacity.
       const exposureResult = await client.query(
         `SELECT
            a.credit_limit_micros,
@@ -153,8 +165,6 @@ export class PostgresDataPlaneBillingStore extends PostgresBillingStore {
 
       const expired = new Date(reservation.expires_at).getTime() <= Date.now();
       if (expired) {
-        // Expired Reservations no longer count as held capacity, so reacquire the
-        // remaining amount under the BillingAccount lock before letting work resume.
         const available = BigInt(exposure.credit_limit_micros)
           + BigInt(exposure.ledger_balance_micros)
           - BigInt(exposure.reserved_micros);
@@ -214,9 +224,8 @@ export class BillingSessionStore implements SessionStore {
     try {
       if (!account.enabled) throw new Error(`Billing account disabled: ${record.tenantId}`);
 
-      const maxCost = record.budget?.max_cost_usd;
-      const hasBudget = typeof maxCost === "number" && Number.isFinite(maxCost) && maxCost > 0;
-      if (!hasBudget) {
+      const requestedMicros = budgetMicros(record);
+      if (!requestedMicros) {
         if (this.requireBudgetForBilledTenant) throw new SessionBudgetRequiredError(record.tenantId);
         return;
       }
@@ -225,11 +234,15 @@ export class BillingSessionStore implements SessionStore {
         tenantId: record.tenantId,
         projectId: record.projectId,
         requestRef: `session:${record.id}`,
-        amountMicros: usdToMicros(String(maxCost)),
+        amountMicros: requestedMicros,
         expiresAt: reservationExpiry(record, this.reservationTtlSeconds),
       });
       await this.billing.attachReservation(reservation.id, record.id);
     } catch (error) {
+      // This catch runs entirely before AgentGateway invokes the provider, so releasing
+      // the just-created reservation is safe. Once provider invocation begins, generic
+      // SessionStore.update failures must never release the hold because the upstream
+      // side effect may already exist.
       if (reservation) {
         await this.billing.releaseReservation(reservation.id).catch(() => undefined);
       }
@@ -252,15 +265,10 @@ export class BillingSessionStore implements SessionStore {
   }
 
   async update(record: SessionRecord) {
+    // Do not infer financial safety from a generic failed binding state. The provider
+    // may have created a Session before local persistence failed. Reservations are
+    // released only by the pre-provider admission path above or explicit reconciliation.
     await this.base.update(record);
-    if (record.state !== "failed") return;
-
-    // Preserve the provider error if releasing the financial hold fails. An active
-    // reservation remains bounded by expires_at and can be reconciled later.
-    const reservation = await this.billing.getSessionReservation(record.id).catch(() => undefined);
-    if (reservation?.state === "active") {
-      await this.billing.releaseReservation(reservation.id).catch(() => undefined);
-    }
   }
 }
 
@@ -331,4 +339,5 @@ export class DataPlaneBilling {
 export {
   BillingInsufficientFundsError,
   SessionBudgetExceededError,
+  usdToMicros,
 };
