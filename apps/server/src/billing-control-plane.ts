@@ -51,10 +51,32 @@ const ROLE_BILLING_PERMISSIONS: Record<ControlPlaneRole, ReadonlySet<BillingPerm
   viewer: BILLING_READ,
 };
 
-class BillingAuthorizationError extends Error {
+export class BillingControlPlaneAuthorizationError extends Error {
   constructor(readonly permission: BillingPermission, readonly tenantId?: string) {
     super(`Control plane permission denied: ${permission}`);
-    this.name = "BillingAuthorizationError";
+    this.name = "BillingControlPlaneAuthorizationError";
+  }
+}
+
+export function hasBillingPermission(
+  actor: ControlPlaneActor,
+  permission: BillingPermission,
+  tenantId?: string,
+) {
+  return actor.bindings.some((binding) => {
+    if (!ROLE_BILLING_PERMISSIONS[binding.role].has(permission)) return false;
+    if (binding.scopeType === "global") return true;
+    return Boolean(tenantId && binding.scopeType === "tenant" && binding.scopeId === tenantId);
+  });
+}
+
+function requireBillingPermission(
+  actor: ControlPlaneActor,
+  permission: BillingPermission,
+  tenantId?: string,
+) {
+  if (!hasBillingPermission(actor, permission, tenantId)) {
+    throw new BillingControlPlaneAuthorizationError(permission, tenantId);
   }
 }
 
@@ -88,17 +110,23 @@ async function readJson(req: http.IncomingMessage) {
   return raw ? JSON.parse(raw) : {};
 }
 
-function json(res: http.ServerResponse, status: number, data: unknown, requestIdValue: string, headers: Record<string, string> = {}) {
+function json(
+  res: http.ServerResponse,
+  status: number,
+  data: unknown,
+  rid: string,
+  headers: Record<string, string> = {},
+) {
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
-    "x-request-id": requestIdValue,
+    "x-request-id": rid,
     ...headers,
   });
   res.end(JSON.stringify(data));
 }
 
 function errorStatus(error: unknown) {
-  if (error instanceof BillingAuthorizationError) return 403;
+  if (error instanceof BillingControlPlaneAuthorizationError) return 403;
   const message = error instanceof Error ? error.message : String(error);
   if (/Invalid control plane token/.test(message)) return 401;
   if (/idempotency request is still in progress|idempotency key was already used/.test(message)) return 409;
@@ -109,25 +137,13 @@ function errorStatus(error: unknown) {
   return 500;
 }
 
-function hasBillingPermission(actor: ControlPlaneActor, permission: BillingPermission, tenantId?: string) {
-  return actor.bindings.some((binding) => {
-    if (!ROLE_BILLING_PERMISSIONS[binding.role].has(permission)) return false;
-    if (binding.scopeType === "global") return true;
-    return Boolean(tenantId && binding.scopeType === "tenant" && binding.scopeId === tenantId);
-  });
-}
-
-function requireBillingPermission(actor: ControlPlaneActor, permission: BillingPermission, tenantId?: string) {
-  if (!hasBillingPermission(actor, permission, tenantId)) {
-    throw new BillingAuthorizationError(permission, tenantId);
-  }
-}
-
 function positiveIntegerString(value: unknown, name: string, allowZero = false) {
   const text = String(value ?? "").trim();
   if (!/^\d+$/.test(text)) throw new Error(`${name} must be an integer string`);
   const parsed = BigInt(text);
-  if (allowZero ? parsed < 0n : parsed <= 0n) throw new Error(`${name} must be ${allowZero ? "non-negative" : "positive"}`);
+  if (allowZero ? parsed < 0n : parsed <= 0n) {
+    throw new Error(`${name} must be ${allowZero ? "non-negative" : "positive"}`);
+  }
   return text;
 }
 
@@ -144,7 +160,6 @@ function parseMetric(value: unknown): UsageMetric {
     "web_search.call",
     "file_search.call",
     "tool.call",
-    "storage.gb_seconds",
     "provider.other",
   ];
   if (typeof value === "string" && allowed.includes(value as UsageMetric)) return value as UsageMetric;
@@ -160,7 +175,9 @@ function parseBook(value: string | null): LedgerBook | undefined {
 function parseLimit(raw: string | null, fallback = 100) {
   if (!raw) return fallback;
   const value = Number(raw);
-  if (!Number.isInteger(value) || value <= 0 || value > 500) throw new Error("limit must be an integer between 1 and 500");
+  if (!Number.isInteger(value) || value <= 0 || value > 500) {
+    throw new Error("limit must be an integer between 1 and 500");
+  }
   return value;
 }
 
@@ -178,8 +195,7 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
     idempotencyCompletedTtlSeconds,
   } = deps;
 
-  // Reuse the Control Plane transaction client so money mutation + AuditEvent +
-  // idempotency completion commit or roll back as one Postgres transaction.
+  // Route billing queries through the same transaction client as Audit/idempotency.
   security.attachTransactionalPool(billing.pool);
 
   async function authenticate(req: http.IncomingMessage): Promise<ControlPlaneActor> {
@@ -226,7 +242,16 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
     try {
       requireBillingPermission(input.actor, input.permission, input.tenantId);
     } catch (error) {
-      await audit({ ...input, outcome: "denied", metadata: { permission: input.permission } }).catch(() => undefined);
+      await audit({
+        actor: input.actor,
+        requestId: input.requestId,
+        action: input.action,
+        resourceType: input.resourceType,
+        resourceId: input.resourceId,
+        tenantId: input.tenantId,
+        outcome: "denied",
+        metadata: { permission: input.permission },
+      }).catch(() => undefined);
       throw error;
     }
   }
@@ -262,8 +287,12 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
         requestHash,
         expiresAt: new Date(Date.now() + idempotencyPendingTtlSeconds * 1000).toISOString(),
       });
-      if (claim.state === "conflict") throw new Error("Control plane idempotency key was already used with a different request");
-      if (claim.state === "in_progress") throw new Error("Control plane idempotency request is still in progress");
+      if (claim.state === "conflict") {
+        throw new Error("Control plane idempotency key was already used with a different request");
+      }
+      if (claim.state === "in_progress") {
+        throw new Error("Control plane idempotency request is still in progress");
+      }
       if (claim.state === "replay") {
         const replay = credentialKeyring.decrypt<{ status: number; body: T }>(claim.responseEnvelope, context);
         await audit({
@@ -291,14 +320,14 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
           tenantId: input.tenantId,
           outcome: "success",
         });
-        const envelope = credentialKeyring.encrypt({ status: input.status, body: result }, context);
+        const encrypted = credentialKeyring.encrypt({ status: input.status, body: result }, context);
         await security.completeControlIdempotency({
           actorId: input.actor.id,
           scope: input.action,
           key,
           requestHash,
           responseStatus: input.status,
-          responseEnvelope: envelope.envelope,
+          responseEnvelope: encrypted.envelope,
           expiresAt: new Date(Date.now() + idempotencyCompletedTtlSeconds * 1000).toISOString(),
         });
         return result;
@@ -306,7 +335,12 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
       return { status: input.status, body, replay: false };
     } catch (error) {
       if (claimed) {
-        await security.releaseControlIdempotency({ actorId: input.actor.id, scope: input.action, key, requestHash }).catch(() => undefined);
+        await security.releaseControlIdempotency({
+          actorId: input.actor.id,
+          scope: input.action,
+          key,
+          requestHash,
+        }).catch(() => undefined);
       }
       await audit({
         actor: input.actor,
@@ -374,16 +408,29 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
       if (match && req.method === "PUT") {
         const tenantId = decodeURIComponent(match[1]);
         const request = await readJson(req) as Record<string, unknown>;
-        const creditLimitMicros = positiveIntegerString(request.credit_limit_micros ?? "0", "credit_limit_micros", true);
+        const creditLimitMicros = positiveIntegerString(
+          request.credit_limit_micros ?? "0",
+          "credit_limit_micros",
+          true,
+        );
         const currency = optionalString(request.currency) ?? "USD";
         if (currency !== "USD") throw new Error("Only USD billing accounts are currently supported");
-        if (request.enabled !== undefined && typeof request.enabled !== "boolean") throw new Error("enabled must be boolean");
+        if (request.enabled !== undefined && typeof request.enabled !== "boolean") {
+          throw new Error("enabled must be boolean");
+        }
         const result = await mutation({
-          req, actor, requestId: rid, permission: "billing.accounts.write", action: "billing.account.upsert",
-          resourceType: "billing_account", resourceId: tenantId, tenantId, request, status: 200,
-          run: () => billing.upsertAccount({ tenantId, currency, creditLimitMicros, enabled: request.enabled as boolean | undefined }),
+          req, actor, requestId: rid, permission: "billing.accounts.write",
+          action: "billing.account.upsert", resourceType: "billing_account",
+          resourceId: tenantId, tenantId, request, status: 200,
+          run: () => billing.upsertAccount({
+            tenantId,
+            currency,
+            creditLimitMicros,
+            enabled: request.enabled as boolean | undefined,
+          }),
         });
-        json(res, result.status, result.body, rid, result.replay ? { "x-agent-gateway-idempotent-replay": "true" } : {});
+        json(res, result.status, result.body, rid,
+          result.replay ? { "x-agent-gateway-idempotent-replay": "true" } : {});
         return true;
       }
 
@@ -391,8 +438,8 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
       if (match && req.method === "GET") {
         const tenantId = decodeURIComponent(match[1]);
         const body = await auditedRead({
-          actor, requestId: rid, permission: "billing.accounts.read", action: "billing.exposure.read",
-          resourceType: "billing_account", tenantId,
+          actor, requestId: rid, permission: "billing.accounts.read",
+          action: "billing.exposure.read", resourceType: "billing_account", tenantId,
           run: async () => {
             const account = await billing.getAccount(tenantId);
             if (!account) throw new Error(`Billing account not found: ${tenantId}`);
@@ -420,8 +467,8 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
       if (path === "/api/gateway/admin/billing/price-rules" && req.method === "GET") {
         const tenantId = optionalString(url.searchParams.get("tenant_id"));
         const body = await auditedRead({
-          actor, requestId: rid, permission: "billing.pricing.read", action: "billing.price_rule.list",
-          resourceType: "price_rule", tenantId,
+          actor, requestId: rid, permission: "billing.pricing.read",
+          action: "billing.price_rule.list", resourceType: "price_rule", tenantId,
           run: () => billing.listPriceRules(tenantId),
         });
         json(res, 200, body, rid);
@@ -432,17 +479,25 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
         const request = await readJson(req) as Record<string, unknown>;
         const tenantId = optionalString(request.tenant_id);
         const effectiveFrom = optionalString(request.effective_from);
-        if (!effectiveFrom || !Number.isFinite(new Date(effectiveFrom).getTime())) throw new Error("effective_from must be an ISO timestamp");
+        if (!effectiveFrom || !Number.isFinite(new Date(effectiveFrom).getTime())) {
+          throw new Error("effective_from must be an ISO timestamp");
+        }
         const effectiveTo = optionalString(request.effective_to);
-        if (effectiveTo && !Number.isFinite(new Date(effectiveTo).getTime())) throw new Error("effective_to must be an ISO timestamp");
+        if (effectiveTo && !Number.isFinite(new Date(effectiveTo).getTime())) {
+          throw new Error("effective_to must be an ISO timestamp");
+        }
         const normalized = {
           tenantId,
           providerType: optionalString(request.provider_type),
           model: optionalString(request.model),
           metric: parseMetric(request.metric),
           unitScale: positiveIntegerString(request.unit_scale, "unit_scale"),
-          upstreamPriceMicros: request.upstream_price_micros == null ? undefined : positiveIntegerString(request.upstream_price_micros, "upstream_price_micros", true),
-          customerPriceMicros: request.customer_price_micros == null ? undefined : positiveIntegerString(request.customer_price_micros, "customer_price_micros", true),
+          upstreamPriceMicros: request.upstream_price_micros == null
+            ? undefined
+            : positiveIntegerString(request.upstream_price_micros, "upstream_price_micros", true),
+          customerPriceMicros: request.customer_price_micros == null
+            ? undefined
+            : positiveIntegerString(request.customer_price_micros, "customer_price_micros", true),
           currency: optionalString(request.currency) ?? "USD",
           effectiveFrom,
           effectiveTo,
@@ -452,12 +507,14 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
           throw new Error("At least one of upstream_price_micros or customer_price_micros is required");
         }
         const result = await mutation({
-          req, actor, requestId: rid, permission: "billing.pricing.write", action: "billing.price_rule.create",
-          resourceType: "price_rule", tenantId, request: normalized, status: 201,
+          req, actor, requestId: rid, permission: "billing.pricing.write",
+          action: "billing.price_rule.create", resourceType: "price_rule", tenantId,
+          request: normalized, status: 201,
           run: () => billing.createPriceRule(normalized),
           resultResourceId: (value: any) => value?.id,
         });
-        json(res, result.status, result.body, rid, result.replay ? { "x-agent-gateway-idempotent-replay": "true" } : {});
+        json(res, result.status, result.body, rid,
+          result.replay ? { "x-agent-gateway-idempotent-replay": "true" } : {});
         return true;
       }
 
@@ -468,17 +525,19 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
         const amountMicros = positiveIntegerString(request.amount_micros, "amount_micros");
         const reason = optionalString(request.reason);
         const result = await mutation({
-          req, actor, requestId: rid, permission: "billing.credits.write", action: "billing.credit.grant",
-          resourceType: "ledger_entry", tenantId, request: { tenantId, amountMicros, reason }, status: 201,
+          req, actor, requestId: rid, permission: "billing.credits.write",
+          action: "billing.credit.grant", resourceType: "ledger_entry", tenantId,
+          request: { tenantId, amountMicros, reason }, status: 201,
           run: (key) => billing.grantCredit({
             tenantId,
             amountMicros,
-            idempotencyKey: `control:${actor.id}:${key}`,
+            idempotencyKey: `control:${actor.id}:billing.credit.grant:${tenantId}:${key}`,
             metadata: { reason, actor_id: actor.id, request_id: rid },
           }),
           resultResourceId: (value: any) => value?.id,
         });
-        json(res, result.status, result.body, rid, result.replay ? { "x-agent-gateway-idempotent-replay": "true" } : {});
+        json(res, result.status, result.body, rid,
+          result.replay ? { "x-agent-gateway-idempotent-replay": "true" } : {});
         return true;
       }
 
@@ -487,8 +546,8 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
         const sessionId = optionalString(url.searchParams.get("session_id"));
         const limit = parseLimit(url.searchParams.get("limit"));
         const body = await auditedRead({
-          actor, requestId: rid, permission: "billing.usage.read", action: "billing.usage.list",
-          resourceType: "usage_event", tenantId,
+          actor, requestId: rid, permission: "billing.usage.read",
+          action: "billing.usage.list", resourceType: "usage_event", tenantId,
           run: () => billing.listUsage({ tenantId, sessionId, limit }),
         });
         json(res, 200, body, rid);
@@ -501,8 +560,8 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
         const book = parseBook(url.searchParams.get("book"));
         const limit = parseLimit(url.searchParams.get("limit"));
         const body = await auditedRead({
-          actor, requestId: rid, permission: "billing.ledger.read", action: "billing.ledger.list",
-          resourceType: "ledger_entry", tenantId,
+          actor, requestId: rid, permission: "billing.ledger.read",
+          action: "billing.ledger.list", resourceType: "ledger_entry", tenantId,
           run: () => billing.listLedger({ tenantId, sessionId, book, limit }),
         });
         json(res, 200, body, rid);
@@ -514,8 +573,8 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
         const sessionId = optionalString(url.searchParams.get("session_id"));
         const limit = parseLimit(url.searchParams.get("limit"));
         const body = await auditedRead({
-          actor, requestId: rid, permission: "billing.reservations.read", action: "billing.reservation.list",
-          resourceType: "reservation", tenantId,
+          actor, requestId: rid, permission: "billing.reservations.read",
+          action: "billing.reservation.list", resourceType: "reservation", tenantId,
           run: async () => {
             const values: unknown[] = [];
             const clauses: string[] = [];
@@ -530,11 +589,18 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
               values,
             );
             return rows.rows.map((row) => ({
-              id: String(row.id), tenantId: String(row.tenant_id), projectId: row.project_id ? String(row.project_id) : undefined,
-              sessionId: row.session_id ? String(row.session_id) : undefined, requestRef: String(row.request_ref),
-              amountMicros: String(row.amount_micros), consumedMicros: String(row.consumed_micros), currency: String(row.currency),
-              state: String(row.state), expiresAt: new Date(row.expires_at).toISOString(),
-              createdAt: new Date(row.created_at).toISOString(), updatedAt: new Date(row.updated_at).toISOString(),
+              id: String(row.id),
+              tenantId: String(row.tenant_id),
+              projectId: row.project_id ? String(row.project_id) : undefined,
+              sessionId: row.session_id ? String(row.session_id) : undefined,
+              requestRef: String(row.request_ref),
+              amountMicros: String(row.amount_micros),
+              consumedMicros: String(row.consumed_micros),
+              currency: String(row.currency),
+              state: String(row.state),
+              expiresAt: new Date(row.expires_at).toISOString(),
+              createdAt: new Date(row.created_at).toISOString(),
+              updatedAt: new Date(row.updated_at).toISOString(),
             }));
           },
         });
@@ -542,11 +608,16 @@ export function createBillingControlPlaneHandler(deps: BillingControlPlaneDepend
         return true;
       }
 
-      json(res, 404, { error: { type: "not_found", message: "Billing Control Plane route not found" } }, rid);
+      json(res, 404, {
+        error: { type: "not_found", message: "Billing Control Plane route not found" },
+      }, rid);
       return true;
     } catch (error) {
       json(res, errorStatus(error), {
-        error: { type: "gateway_error", message: error instanceof Error ? error.message : String(error) },
+        error: {
+          type: "gateway_error",
+          message: error instanceof Error ? error.message : String(error),
+        },
       }, rid);
       return true;
     }
