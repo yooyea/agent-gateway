@@ -46,6 +46,7 @@ import { createControlPlaneHandler } from "./control-plane.js";
 import {
   applyCommercialSessionBudget,
   resolveRuntimeAdmission,
+  runtimeAdmissionKey,
   type RuntimeAdmissionPolicy,
 } from "./commercial-runtime.js";
 
@@ -498,8 +499,9 @@ async function resolveCommercialPolicy(context: GatewayRequestContext): Promise<
 
 async function enforceRateLimit(context: GatewayRequestContext, admission: RuntimeAdmissionPolicy) {
   if (!runtimeControls) return {} as Record<string, string>;
+  const admissionKey = runtimeAdmissionKey(context.tenantId, runtimeIdentity(context), admission);
   const decision = await runtimeControls.checkRateLimit({
-    key: runtimeIdentity(context),
+    key: admissionKey,
     limit: admission.requestsPerMinute,
     windowSeconds: rateLimitWindowSeconds,
   });
@@ -556,7 +558,7 @@ function withConcurrency<T>(
   run: () => Promise<T>,
 ) {
   return withLease({
-    key: runtimeIdentity(context),
+    key: runtimeAdmissionKey(context.tenantId, runtimeIdentity(context), admission),
     limit: admission.maxConcurrency,
     limitType: "concurrency",
     run,
