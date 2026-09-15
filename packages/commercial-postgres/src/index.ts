@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { Pool, type PoolClient, type PoolConfig } from "pg";
+import { Pool, type PoolConfig } from "pg";
 
 export type PlanStatus = "active" | "archived";
 export type BillingInterval = "month" | "year";
@@ -223,21 +223,6 @@ export class PostgresCommercialStore {
   async close() { await this.pool.end(); }
   async migrate() { await this.pool.query(SCHEMA_SQL); }
 
-  async withTransaction<T>(fn: (client: PoolClient) => Promise<T>) {
-    const client = await this.pool.connect();
-    try {
-      await client.query("BEGIN");
-      const value = await fn(client);
-      await client.query("COMMIT");
-      return value;
-    } catch (error) {
-      await client.query("ROLLBACK");
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
-
   async createPlan(input: { id?: string; name: string; description?: string }) {
     const id = input.id ?? `agplan_${randomUUID().replaceAll("-", "")}`;
     const result = await this.pool.query(
@@ -273,32 +258,35 @@ export class PostgresCommercialStore {
     effectiveFrom?: string;
   }) {
     const id = input.id ?? `agplanv_${randomUUID().replaceAll("-", "")}`;
-    return this.withTransaction(async (client) => {
-      const plan = await client.query(`SELECT id,status FROM gateway_plans WHERE id=$1 FOR UPDATE`, [input.planId]);
-      if (!plan.rows[0]) throw new Error(`Plan not found: ${input.planId}`);
-      if (plan.rows[0].status !== "active") throw new Error(`Plan is not active: ${input.planId}`);
-      const next = await client.query<{ version: number }>(
-        `SELECT COALESCE(MAX(version),0)+1 AS version FROM gateway_plan_versions WHERE plan_id=$1`, [input.planId]);
-      const defaultBudget = input.defaultSessionBudgetMicros == null
-        ? null : BigInt(input.defaultSessionBudgetMicros).toString();
-      if (defaultBudget !== null && BigInt(defaultBudget) <= 0n) {
-        throw new Error("defaultSessionBudgetMicros must be positive");
-      }
-      const result = await client.query(
-        `INSERT INTO gateway_plan_versions(
-          id,plan_id,version,currency,billing_interval,recurring_price_micros,included_credit_micros,
-          default_session_budget_micros,requests_per_minute,max_concurrency,entitlements,effective_from
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12) RETURNING *`,
-        [
-          id,input.planId,Number(next.rows[0]?.version ?? 1),input.currency ?? "USD",input.billingInterval,
-          integerMicros(input.recurringPriceMicros),integerMicros(input.includedCreditMicros),defaultBudget,
-          positiveInteger(input.requestsPerMinute,"requestsPerMinute") ?? null,
-          positiveInteger(input.maxConcurrency,"maxConcurrency") ?? null,
-          JSON.stringify(input.entitlements ?? {}),input.effectiveFrom ?? new Date().toISOString(),
-        ],
-      );
-      return versionFromRow(result.rows[0]);
-    });
+    const defaultBudget = input.defaultSessionBudgetMicros == null
+      ? null : BigInt(input.defaultSessionBudgetMicros).toString();
+    if (defaultBudget !== null && BigInt(defaultBudget) <= 0n) {
+      throw new Error("defaultSessionBudgetMicros must be positive");
+    }
+
+    // These queries intentionally use pool.query instead of pool.connect. During a governed
+    // Control Plane mutation PostgresControlPlaneSecurity redirects this Pool to the shared
+    // transaction client, so plan locking/version allocation + insert commit atomically with
+    // Audit and idempotency completion.
+    const plan = await this.pool.query(`SELECT id,status FROM gateway_plans WHERE id=$1 FOR UPDATE`, [input.planId]);
+    if (!plan.rows[0]) throw new Error(`Plan not found: ${input.planId}`);
+    if (plan.rows[0].status !== "active") throw new Error(`Plan is not active: ${input.planId}`);
+    const next = await this.pool.query<{ version: number }>(
+      `SELECT COALESCE(MAX(version),0)+1 AS version FROM gateway_plan_versions WHERE plan_id=$1`, [input.planId]);
+    const result = await this.pool.query(
+      `INSERT INTO gateway_plan_versions(
+        id,plan_id,version,currency,billing_interval,recurring_price_micros,included_credit_micros,
+        default_session_budget_micros,requests_per_minute,max_concurrency,entitlements,effective_from
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12) RETURNING *`,
+      [
+        id,input.planId,Number(next.rows[0]?.version ?? 1),input.currency ?? "USD",input.billingInterval,
+        integerMicros(input.recurringPriceMicros),integerMicros(input.includedCreditMicros),defaultBudget,
+        positiveInteger(input.requestsPerMinute,"requestsPerMinute") ?? null,
+        positiveInteger(input.maxConcurrency,"maxConcurrency") ?? null,
+        JSON.stringify(input.entitlements ?? {}),input.effectiveFrom ?? new Date().toISOString(),
+      ],
+    );
+    return versionFromRow(result.rows[0]);
   }
 
   async listPlanVersions(planId: string) {
@@ -327,40 +315,40 @@ export class PostgresCommercialStore {
       throw new Error("endsAt must be after startsAt");
     }
 
-    return this.withTransaction(async (client) => {
-      const tenant = await client.query(`SELECT id FROM gateway_tenants WHERE id=$1 FOR UPDATE`, [input.tenantId]);
-      if (!tenant.rows[0]) throw new Error(`Tenant not found: ${input.tenantId}`);
-      const version = await client.query(
-        `SELECT pv.*,p.status AS plan_status FROM gateway_plan_versions pv
-         JOIN gateway_plans p ON p.id=pv.plan_id WHERE pv.id=$1`, [input.planVersionId]);
-      if (!version.rows[0]) throw new Error(`Plan version not found: ${input.planVersionId}`);
-      if (version.rows[0].plan_status !== "active") throw new Error("Cannot subscribe to an archived Plan");
-      if (new Date(version.rows[0].effective_from).getTime() > startsAt.getTime()) {
-        throw new Error("Plan version is not effective at subscription start");
-      }
-      const overlap = await client.query(
-        `SELECT id FROM gateway_subscriptions
-         WHERE tenant_id=$1 AND status IN ('scheduled','active')
-           AND tstzrange(starts_at,COALESCE(ends_at,'infinity'::timestamptz),'[)')
-             && tstzrange($2::timestamptz,COALESCE($3::timestamptz,'infinity'::timestamptz),'[)')
-         LIMIT 1`,
-        [input.tenantId,startsAt.toISOString(),endsAt?.toISOString() ?? null],
-      );
-      if (overlap.rows[0]) throw new Error(`Tenant already has an overlapping subscription: ${overlap.rows[0].id}`);
+    // Tenant row locking serializes subscription interval admission when invoked from the
+    // governed Control Plane transaction. pool.query keeps this lock in the outer transaction.
+    const tenant = await this.pool.query(`SELECT id FROM gateway_tenants WHERE id=$1 FOR UPDATE`, [input.tenantId]);
+    if (!tenant.rows[0]) throw new Error(`Tenant not found: ${input.tenantId}`);
+    const version = await this.pool.query(
+      `SELECT pv.*,p.status AS plan_status FROM gateway_plan_versions pv
+       JOIN gateway_plans p ON p.id=pv.plan_id WHERE pv.id=$1`, [input.planVersionId]);
+    if (!version.rows[0]) throw new Error(`Plan version not found: ${input.planVersionId}`);
+    if (version.rows[0].plan_status !== "active") throw new Error("Cannot subscribe to an archived Plan");
+    if (new Date(version.rows[0].effective_from).getTime() > startsAt.getTime()) {
+      throw new Error("Plan version is not effective at subscription start");
+    }
+    const overlap = await this.pool.query(
+      `SELECT id FROM gateway_subscriptions
+       WHERE tenant_id=$1 AND status IN ('scheduled','active')
+         AND tstzrange(starts_at,COALESCE(ends_at,'infinity'::timestamptz),'[)')
+           && tstzrange($2::timestamptz,COALESCE($3::timestamptz,'infinity'::timestamptz),'[)')
+       LIMIT 1`,
+      [input.tenantId,startsAt.toISOString(),endsAt?.toISOString() ?? null],
+    );
+    if (overlap.rows[0]) throw new Error(`Tenant already has an overlapping subscription: ${overlap.rows[0].id}`);
 
-      const interval = version.rows[0].billing_interval as BillingInterval;
-      let periodEnd = addBillingInterval(startsAt, interval);
-      if (endsAt && endsAt < periodEnd) periodEnd = endsAt;
-      const status: SubscriptionStatus = startsAt.getTime() > Date.now() ? "scheduled" : "active";
-      const result = await client.query(
-        `INSERT INTO gateway_subscriptions(
-          id,tenant_id,plan_version_id,status,starts_at,ends_at,current_period_start,current_period_end
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-        [id,input.tenantId,input.planVersionId,status,startsAt.toISOString(),endsAt?.toISOString() ?? null,
-          startsAt.toISOString(),periodEnd.toISOString()],
-      );
-      return subscriptionFromRow(result.rows[0]);
-    });
+    const interval = version.rows[0].billing_interval as BillingInterval;
+    let periodEnd = addBillingInterval(startsAt, interval);
+    if (endsAt && endsAt < periodEnd) periodEnd = endsAt;
+    const status: SubscriptionStatus = startsAt.getTime() > Date.now() ? "scheduled" : "active";
+    const result = await this.pool.query(
+      `INSERT INTO gateway_subscriptions(
+        id,tenant_id,plan_version_id,status,starts_at,ends_at,current_period_start,current_period_end
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [id,input.tenantId,input.planVersionId,status,startsAt.toISOString(),endsAt?.toISOString() ?? null,
+        startsAt.toISOString(),periodEnd.toISOString()],
+    );
+    return subscriptionFromRow(result.rows[0]);
   }
 
   async listSubscriptions(tenantId?: string) {
@@ -373,7 +361,14 @@ export class PostgresCommercialStore {
   async cancelSubscription(id: string, at = new Date().toISOString()) {
     const result = await this.pool.query(
       `UPDATE gateway_subscriptions
-       SET status='canceled',canceled_at=$2,ends_at=LEAST(COALESCE(ends_at,$2::timestamptz),$2::timestamptz),updated_at=now()
+       SET status='canceled',
+           canceled_at=$2,
+           ends_at=CASE
+             WHEN starts_at <= $2::timestamptz
+               THEN LEAST(COALESCE(ends_at,$2::timestamptz),$2::timestamptz)
+             ELSE ends_at
+           END,
+           updated_at=now()
        WHERE id=$1 AND status IN ('scheduled','active') RETURNING *`,
       [id,at],
     );
