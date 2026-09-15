@@ -29,6 +29,7 @@ import {
   usdToMicros,
 } from "@agent-gateway/billing-runtime";
 import { PostgresControlPlaneSecurity } from "@agent-gateway/control-plane-auth";
+import { PostgresCommercialStore, type CommercialPolicy } from "@agent-gateway/commercial-postgres";
 import { CredentialKeyring, credentialContext } from "@agent-gateway/credential-crypto";
 import { RedisRuntimeControls } from "@agent-gateway/runtime-redis";
 import { PostgresGatewayStore, type RuntimeChannelRecord } from "@agent-gateway/storage-postgres";
@@ -40,7 +41,14 @@ import type {
   SessionEventBatch,
 } from "@agent-gateway/protocol";
 import { createBillingControlPlaneHandler } from "./billing-control-plane.js";
+import { createCommercialControlPlaneHandler } from "./commercial-control-plane.js";
 import { createControlPlaneHandler } from "./control-plane.js";
+import {
+  applyCommercialSessionBudget,
+  resolveRuntimeAdmission,
+  runtimeAdmissionKey,
+  type RuntimeAdmissionPolicy,
+} from "./commercial-runtime.js";
 
 interface GatewayConfig {
   defaultProvider?: string;
@@ -123,6 +131,7 @@ async function createPersistence(): Promise<{
   database?: PostgresGatewayStore;
   controlSecurity?: PostgresControlPlaneSecurity;
   billing?: PostgresDataPlaneBillingStore;
+  commercial?: PostgresCommercialStore;
 }> {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
@@ -143,6 +152,7 @@ async function createPersistence(): Promise<{
   const billing = new PostgresDataPlaneBillingStore(databaseUrl, {
     reservationRenewalTtlSeconds: reservationTtlSeconds,
   });
+  const commercial = new PostgresCommercialStore(databaseUrl);
   controlSecurity.attachTransactionalPool(store.pool);
 
   const autoMigrate = process.env.AGENT_GATEWAY_AUTO_MIGRATE === "true" ||
@@ -151,6 +161,7 @@ async function createPersistence(): Promise<{
     await store.migrate();
     await controlSecurity.migrate();
     await billing.migrate();
+    await commercial.migrate();
   }
   if (process.env.AGENT_GATEWAY_DEV_BOOTSTRAP === "true") {
     if (process.env.NODE_ENV === "production") {
@@ -170,6 +181,7 @@ async function createPersistence(): Promise<{
     database: store,
     controlSecurity,
     billing,
+    commercial,
   };
 }
 
@@ -371,6 +383,17 @@ const billingControlPlaneHandler = persistence.billing && persistence.controlSec
   })
   : undefined;
 
+const commercialControlPlaneHandler = persistence.commercial && persistence.controlSecurity
+  ? createCommercialControlPlaneHandler({
+    commercial: persistence.commercial,
+    security: persistence.controlSecurity,
+    credentialKeyring,
+    bootstrapToken,
+    idempotencyPendingTtlSeconds,
+    idempotencyCompletedTtlSeconds,
+  })
+  : undefined;
+
 async function readJson(req: http.IncomingMessage) {
   let raw = "";
   for await (const chunk of req) raw += chunk;
@@ -470,11 +493,16 @@ function runtimeIdentity(context: GatewayRequestContext) {
   return `${context.tenantId}:${context.virtualKeyId ?? context.projectId ?? "tenant"}`;
 }
 
-async function enforceRateLimit(context: GatewayRequestContext) {
+async function resolveCommercialPolicy(context: GatewayRequestContext): Promise<CommercialPolicy | undefined> {
+  return persistence.commercial?.resolvePolicy(context.tenantId);
+}
+
+async function enforceRateLimit(context: GatewayRequestContext, admission: RuntimeAdmissionPolicy) {
   if (!runtimeControls) return {} as Record<string, string>;
+  const admissionKey = runtimeAdmissionKey(context.tenantId, runtimeIdentity(context), admission);
   const decision = await runtimeControls.checkRateLimit({
-    key: runtimeIdentity(context),
-    limit: rateLimitRequests,
+    key: admissionKey,
+    limit: admission.requestsPerMinute,
     windowSeconds: rateLimitWindowSeconds,
   });
   const headers = {
@@ -524,10 +552,14 @@ async function withLease<T>(input: {
   }
 }
 
-function withConcurrency<T>(context: GatewayRequestContext, run: () => Promise<T>) {
+function withConcurrency<T>(
+  context: GatewayRequestContext,
+  admission: RuntimeAdmissionPolicy,
+  run: () => Promise<T>,
+) {
   return withLease({
-    key: runtimeIdentity(context),
-    limit: maxConcurrency,
+    key: runtimeAdmissionKey(context.tenantId, runtimeIdentity(context), admission),
+    limit: admission.maxConcurrency,
     limitType: "concurrency",
     run,
   });
@@ -687,6 +719,7 @@ http.createServer(async (req, res) => {
         persistence: database ? "postgres" : "memory",
         runtime: redis ? "redis" : "disabled",
         billing: persistence.billing ? "postgres" : "disabled",
+        commercial: persistence.commercial ? "postgres" : "disabled",
         database,
         redis,
       });
@@ -704,11 +737,19 @@ http.createServer(async (req, res) => {
       if (billingControlPlaneHandler && path.startsWith("/api/gateway/admin/billing/")) {
         if (await billingControlPlaneHandler(req, res, path)) return;
       }
+      if (commercialControlPlaneHandler && path.startsWith("/api/gateway/admin/commercial/")) {
+        if (await commercialControlPlaneHandler(req, res, path)) return;
+      }
       if (await controlPlaneHandler(req, res, path)) return;
     }
 
     const context = await persistence.authenticator.authenticate(req.headers.authorization);
-    const rateHeaders = await enforceRateLimit(context);
+    const commercialPolicy = await resolveCommercialPolicy(context);
+    const admission = resolveRuntimeAdmission(commercialPolicy, {
+      requestsPerMinute: rateLimitRequests,
+      maxConcurrency,
+    });
+    const rateHeaders = await enforceRateLimit(context, admission);
 
     if (req.method === "GET" && path === "/api/gateway/channels") {
       return json(res, 200, await gateway.channels(), rateHeaders);
@@ -724,7 +765,7 @@ http.createServer(async (req, res) => {
           },
         }, rateHeaders);
       }
-      const hints = routeHints(req);
+      const hints = applyCommercialSessionBudget(routeHints(req), commercialPolicy);
       const result = await executeIdempotent({
         req,
         context,
@@ -733,6 +774,7 @@ http.createServer(async (req, res) => {
         run: async () => {
           const session = await withConcurrency(
             context,
+            admission,
             () => gateway.createSession(body, context, hints),
           );
           await observeSessionUsageBestEffort(session, context, body.agent?.model);
@@ -751,6 +793,7 @@ http.createServer(async (req, res) => {
       const sessionContext = await scopedSessionContext(sessionId, context);
       const session = await withConcurrency(
         sessionContext,
+        admission,
         () => gateway.getSession(sessionId, sessionContext),
       );
       await observeSessionUsageBestEffort(session, sessionContext);
@@ -762,7 +805,7 @@ http.createServer(async (req, res) => {
       const sessionId = decodeURIComponent(match[1]);
       const sessionContext = await scopedSessionContext(sessionId, context);
       const events = (await readJson(req)) as SessionEventBatch;
-      await withConcurrency(sessionContext, () => withSessionConcurrency(sessionId, async () => {
+      await withConcurrency(sessionContext, admission, () => withSessionConcurrency(sessionId, async () => {
         await assertBudgetBeforeProviderWork(sessionId, sessionContext);
         await gateway.sendEvents(sessionId, events, sessionContext);
         await reconcileSessionUsageBestEffort(sessionId, sessionContext);
@@ -774,7 +817,7 @@ http.createServer(async (req, res) => {
     if (req.method === "GET" && match) {
       const sessionId = decodeURIComponent(match[1]);
       const sessionContext = await scopedSessionContext(sessionId, context);
-      await withConcurrency(sessionContext, () => withSessionConcurrency(sessionId, async () => {
+      await withConcurrency(sessionContext, admission, () => withSessionConcurrency(sessionId, async () => {
         await assertBudgetBeforeProviderWork(sessionId, sessionContext);
         const stream = await gateway.streamEvents(sessionId, sessionContext);
         res.writeHead(200, {

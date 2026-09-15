@@ -19,7 +19,8 @@
     {"path":"../../packages/runtime-redis"},
     {"path":"../../packages/storage-postgres"},
     {"path":"../../packages/billing-postgres"},
-    {"path":"../../packages/billing-runtime"}
+    {"path":"../../packages/billing-runtime"},
+    {"path":"../../packages/commercial-postgres"}
   ],
   "include": ["src/**/*.ts"]
 }

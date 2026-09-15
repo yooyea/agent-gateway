@@ -10,7 +10,7 @@ The gateway sits between arbitrary callers and heterogeneous Agent runtimes.
 Caller -> Agent Gateway -> Provider Channel -> Agent Runtime
 ```
 
-Callers integrate with the gateway, not with a specific upstream account. The gateway owns authentication, routing, Session affinity, metering, billing, governance and observability concerns that should not be reimplemented by every product.
+Callers integrate with the gateway, not with a specific upstream account. The gateway owns authentication, routing, Session affinity, metering, billing, commercial policy, governance and observability concerns that should not be reimplemented by every product.
 
 ## Core domain
 
@@ -40,6 +40,7 @@ Provider model calls are implementation details inside an Agent lifecycle. Do no
 - Circuit breakers, disabled Channels and routing policy affect new Sessions only.
 - Never make a live session silently jump providers or channels. Migration is explicit and has lineage + declared semantic loss.
 - A Project-scoped Virtual Key may access only Sessions belonging to that same Project. Tenant-level keys may access Sessions across Projects in the Tenant.
+- An effective Session budget is persisted at Session creation; later Plan/subscription changes must not retroactively change it.
 
 ## Control Plane authorization rules
 
@@ -61,23 +62,36 @@ Provider model calls are implementation details inside an Agent lifecycle. Do no
 - Every Control Plane mutation records actor, request id, action, resource, outcome and non-secret metadata.
 - A successful Control Plane resource mutation, its success AuditEvent, and its idempotency completion must commit in the same Postgres transaction.
 - A failed mutation must roll back the resource and success AuditEvent together; an error AuditEvent may be appended only after rollback.
-- Runtime side effects derived from Control Plane state (for example registry reload) happen after durable commit and must not turn an already-committed mutation into a false retry signal.
+- Runtime side effects derived from Control Plane state happen after durable commit and must not turn an already-committed mutation into a false retry signal.
 - Bearer tokens, Virtual Key plaintext, Credential payloads, ciphertext, master keys and decrypted upstream credentials must never enter audit metadata.
 - Every Control Plane response, including failures, must expose the same request id used by its audit evidence.
+
+## Commercial contract rules
+
+- `Plan` is a mutable product identity; `PlanVersion` is an immutable commercial terms snapshot.
+- Never update/delete a PlanVersion to change an offer. Create a new version.
+- A Subscription pins exactly one Tenant to exactly one PlanVersion; it never follows a moving "latest" Plan version.
+- Subscription commercial identity (`Tenant + PlanVersion + starts_at`) is immutable.
+- A Tenant must not have overlapping scheduled/active subscription intervals.
+- CommercialPolicy is a runtime projection of the active Subscription; it is not financial truth.
+- Plan RPM/concurrency override environment fallback limits when present. Missing Plan values use environment defaults.
+- A Plan default Session budget applies only when the caller does not explicitly declare one.
+- `included_credit_micros` is an entitlement declaration, not a mutable/spendable wallet balance. Spendability begins only when a CreditBucket/Ledger grant is materialized.
+- Commercial money values use exact integer micros. JavaScript floating point is never authoritative.
 
 ## Data Plane billing rules
 
 - Postgres financial state is authoritative. Redis must never become a balance, Reservation, UsageEvent or Ledger source of truth.
-- A Tenant with a BillingAccount is billed. Until plan/default budgets exist, every new billed Session must declare a positive hard `max_cost_usd`.
+- A Tenant with a BillingAccount is billed. A new billed Session must have a positive hard budget either explicitly supplied by the caller or resolved from active CommercialPolicy.
 - A billed Session must persist its `creating` SessionBinding and reserve customer capacity **before** the upstream Provider is contacted.
 - If financial admission fails, do not call the Provider.
-- Provider Session creation failure must release the attached active Reservation best-effort; Reservation expiry remains the safety net.
+- Once Provider invocation may have started, do not release a Reservation merely because local binding/provider completion is ambiguous; preserve the financial hold until reconciliation/expiry handling.
 - Active Reservation exposure is the unconsumed amount. Spend already represented in the customer Ledger must not also remain fully reserved.
 - Before additional Agent work, refresh cumulative provider usage, settle the delta and evaluate remaining SessionBudget before contacting the Provider.
 - Usage refresh/budget admission before provider work is fail-closed for billed Sessions.
 - Once an upstream mutation has succeeded, post-operation usage reconciliation is best-effort; an accounting-refresh failure must not turn provider success into a false client retry signal.
 - The next expensive operation must catch up through strict preflight reconciliation.
-- Data Plane idempotency claims may be released when execution fails before a successful upstream side effect. After upstream success, a failed idempotency completion must fail closed rather than make immediate duplicate execution possible.
+- Data Plane idempotency claims may be released only for failures known to occur before an upstream side effect. Potentially side-effecting failures remain pending.
 - Long opaque SSE streams currently enforce budget at stream admission and reconcile on completion. Do not claim mid-stream hard-stop precision until provider usage is observable during the stream.
 
 ## Financial data rules
@@ -90,6 +104,7 @@ Provider model calls are implementation details inside an Agent lifecycle. Do no
 - Provider corrections append negative adjustment UsageEvents and refund/adjustment LedgerEntries instead of rewriting history.
 - Effective PriceRules are snapshotted into LedgerEntries. Later price changes never rewrite historical charges.
 - Money is stored in integer micros / exact database numeric arithmetic. JavaScript floating point is not a financial source of truth.
+- Commercial entitlement state must never rewrite prior UsageEvent or LedgerEntry history.
 
 ## Northbound API rule
 
@@ -118,13 +133,14 @@ Control Plane domains include:
 - providers / channels / credentials
 - routing policies
 - quotas / rate limits / concurrency
+- plans / plan versions / subscriptions / commercial policy
 - budgets / reservations
 - pricing / usage / ledger / invoices
 - audit / traces / metrics
 
 ## Persistence rule
 
-- Postgres is the durable source of truth for identity, RBAC, audit, Provider/Channel/Credential configuration, SessionBindings, idempotency and financial records.
+- Postgres is the durable source of truth for identity, RBAC, audit, Provider/Channel/Credential configuration, commercial contracts, SessionBindings, idempotency and financial records.
 - Redis contains only reconstructable or lease-based runtime state: cache, rate windows, concurrency leases and circuit state.
 - Master Credential encryption keys come from the runtime secret boundary (environment/KMS integration), never Postgres.
 - In-memory stores and environment-backed caller keys are development adapters only.
@@ -143,10 +159,11 @@ When the system changes materially, update the relevant normative documents in t
 2. `docs/architecture.md` when component boundaries or runtime flows change.
 3. `docs/api-spec.md` when public or management APIs change.
 4. `docs/billing.md` when usage, price, reservation or settlement semantics change.
-5. `docs/provider-plugin.md` when provider/channel contracts change.
-6. `docs/credentials.md` when Provider/Channel/Credential storage, encryption or rotation changes.
-7. `docs/rbac-audit.md` when Control Plane identity, permissions, scopes or audit semantics change.
-8. `CHANGELOG.md` for every externally meaningful change.
+5. `docs/commercial.md` when Plan/PlanVersion/Subscription/entitlement semantics change.
+6. `docs/provider-plugin.md` when provider/channel contracts change.
+7. `docs/credentials.md` when Provider/Channel/Credential storage, encryption or rotation changes.
+8. `docs/rbac-audit.md` when Control Plane identity, permissions, scopes or audit semantics change.
+9. `CHANGELOG.md` for every externally meaningful change.
 
 Code and ontology must not knowingly drift.
 

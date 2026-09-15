@@ -15,6 +15,8 @@ test("bootstrap actor has every permission", () => {
   const actor = bootstrapActor();
   assert.equal(hasPermission(actor, "rbac.manage"), true);
   assert.equal(hasPermission(actor, "credentials.rewrap"), true);
+  assert.equal(hasPermission(actor, "commercial.plans.write"), true);
+  assert.equal(hasPermission(actor, "commercial.policy.read", "tenant-a"), true);
 });
 
 test("tenant-scoped viewer only applies inside its tenant", () => {
@@ -34,6 +36,32 @@ test("tenant-scoped viewer only applies inside its tenant", () => {
   assert.equal(hasPermission(actor, "channels.read", "tenant-a"), true);
   assert.equal(hasPermission(actor, "channels.read", "tenant-b"), false);
   assert.throws(() => requirePermission(actor, "channels.write", "tenant-a"));
+  assert.equal(hasPermission(actor, "commercial.subscriptions.read", "tenant-a"), true);
+  assert.equal(hasPermission(actor, "commercial.policy.read", "tenant-a"), true);
+  assert.equal(hasPermission(actor, "commercial.policy.read", "tenant-b"), false);
+  assert.equal(hasPermission(actor, "commercial.plans.read"), false,
+    "Plan resources are global and tenant scope must not authorize them");
+  assert.equal(hasPermission(actor, "commercial.plans.write", "tenant-a"), false);
+});
+
+test("operator has commercial reads but not commercial writes", () => {
+  const actor = {
+    id: "p2",
+    name: "operator",
+    kind: "principal" as const,
+    bindings: [{
+      id: "b2",
+      principalId: "p2",
+      role: "operator" as const,
+      scopeType: "global" as const,
+      createdAt: new Date().toISOString(),
+    }],
+  };
+  assert.equal(hasPermission(actor, "commercial.plans.read"), true);
+  assert.equal(hasPermission(actor, "commercial.subscriptions.read", "tenant-a"), true);
+  assert.equal(hasPermission(actor, "commercial.policy.read", "tenant-a"), true);
+  assert.equal(hasPermission(actor, "commercial.plans.write"), false);
+  assert.equal(hasPermission(actor, "commercial.subscriptions.write", "tenant-a"), false);
 });
 
 test("Postgres RBAC, control idempotency and atomic audit transaction", { skip: !databaseUrl }, async () => {
@@ -66,6 +94,8 @@ test("Postgres RBAC, control idempotency and atomic audit transaction", { skip: 
   assert(actor);
   assert.equal(hasPermission(actor, "channels.write"), true);
   assert.equal(hasPermission(actor, "rbac.manage"), false);
+  assert.equal(hasPermission(actor, "commercial.plans.read"), true);
+  assert.equal(hasPermission(actor, "commercial.plans.write"), false);
 
   await security.appendAudit({
     id: auditId,
@@ -112,7 +142,6 @@ test("Postgres RBAC, control idempotency and atomic audit transaction", { skip: 
     state: "conflict",
   });
 
-  // An expired one-shot key must be cleanable even when that exact key is never retried.
   const abandonedKey = `abandoned-${suffix}`;
   await external.query(
     `INSERT INTO gateway_control_idempotency(

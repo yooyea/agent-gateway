@@ -66,17 +66,22 @@ Rules:
 - Max cost must be positive and contain at most six decimal places.
 - Max cost is converted directly from decimal text into exact integer USD micros.
 - The normalized micros value participates in Session-create idempotency fingerprinting.
+- If the caller omits max cost and the active PlanVersion defines `default_session_budget_micros`, that exact value becomes the Session budget.
+- A caller-explicit max cost wins over the Plan default.
 
 Billing activation:
 
 - Tenant without BillingAccount: unbilled/legacy path.
-- enabled BillingAccount: hard max-cost budget required.
+- enabled BillingAccount: hard max-cost budget required; an active Plan default may satisfy this requirement.
 - disabled BillingAccount: billed work rejected.
 
 Creation order:
 
 ```text
-select Channel
+VirtualKey -> Tenant
+  -> resolve active CommercialPolicy
+  -> resolve effective Session budget
+  -> select Channel
   -> allocate agsess_...
   -> persist SessionBinding(state=creating)
   -> if billed: reserve exact max-cost capacity
@@ -86,6 +91,8 @@ select Channel
 ```
 
 Only failures known to occur before Provider invocation may safely release the pre-provider financial hold. Once Provider invocation may have begun, generic binding/provider failure is treated as potentially side-effecting and the hold remains until reconciliation/expiry handling.
+
+The effective Session budget is persisted with the Session. Later Plan/subscription changes do not rewrite an existing Session budget.
 
 A completed idempotent replay includes:
 
@@ -112,7 +119,8 @@ POST /agents/sessions/{gateway_session_id}/events
 Before additional billed Agent work, the gateway executes under an exclusive per-Session runtime lease:
 
 ```text
-retrieve provider Session
+resolve current CommercialPolicy admission limits
+  -> retrieve provider Session
   -> observe cumulative usage
   -> settle delta
   -> fail closed on unresolved customer pricing
@@ -134,9 +142,29 @@ Accept: text/event-stream
 
 The same Session lease + strict financial preflight runs before stream start.
 
-Provider streams are currently opaque bytes. v0.5/v0.6 therefore reconcile cumulative usage after stream completion; precise mid-stream cutoff requires incremental provider usage observability.
+Provider streams are currently opaque bytes. v0.5-v0.7 therefore reconcile cumulative usage after stream completion; precise mid-stream cutoff requires incremental provider usage observability.
 
-## 7. Billing admission errors
+## 7. Runtime commercial admission
+
+For every authenticated Data Plane request, the gateway resolves the Tenant's current CommercialPolicy.
+
+An active PlanVersion may define:
+
+- `requests_per_minute`
+- `max_concurrency`
+- `default_session_budget_micros`
+
+Runtime semantics:
+
+- Plan RPM overrides the environment RPM fallback when present.
+- Plan max concurrency overrides the environment concurrency fallback when present.
+- Missing Plan values fall back to the environment defaults.
+- Session budget default is applied only during new Session creation when the caller did not explicitly declare a budget.
+- Included credits are not yet spendable from CommercialPolicy alone; see the CreditBucket boundary in `docs/commercial.md`.
+
+Rate/concurrency rejection remains HTTP 429 using the existing gateway limit headers.
+
+## 8. Billing admission errors
 
 Insufficient Tenant capacity:
 
@@ -177,7 +205,7 @@ X-Agent-Gateway-Limit-Type: budget
 X-Agent-Gateway-Budget-Remaining-Micros: 0
 ```
 
-## 8. Runtime Channel view
+## 9. Runtime Channel view
 
 ```http
 GET /api/gateway/channels
@@ -186,9 +214,9 @@ Authorization: Bearer ag_xxx
 
 Returns Channel runtime/circuit health without Credential material.
 
-## 9. Control Plane permissions
+## 10. Control Plane permissions
 
-The authoritative permission vocabulary and role mapping live in `@agent-gateway/control-plane-auth`. Billing does not maintain a second HTTP-local role policy.
+The authoritative permission vocabulary and role mapping live in `@agent-gateway/control-plane-auth`. Domain handlers do not maintain independent role policy.
 
 Core permissions:
 
@@ -221,25 +249,28 @@ billing.ledger.read
 billing.reservations.read
 ```
 
+Commercial permissions:
+
+```text
+commercial.plans.read
+commercial.plans.write
+commercial.subscriptions.read
+commercial.subscriptions.write
+commercial.policy.read
+```
+
 Role bundles:
 
 - `owner`: all permissions.
-- `admin`: all operational and Billing permissions except `rbac.manage`.
-- `operator`: existing operational permissions plus Billing reads only.
-- `viewer`: existing read permissions plus Billing reads only.
+- `admin`: all operational, Billing and Commercial permissions except `rbac.manage`.
+- `operator`: operational permissions plus Billing/Commercial reads only.
+- `viewer`: read permissions including Billing/Commercial reads.
 
 Role Bindings are `global` or `tenant` scoped.
 
-Provider, Credential, Channel and RBAC resources are gateway-global. Project, Virtual Key and Billing Tenant resources may carry Tenant scope.
+Provider, Credential, Channel, RBAC, Plan and PlanVersion resources are gateway-global. Project, Virtual Key, Billing Tenant, Subscription and CommercialPolicy resources may carry Tenant scope.
 
-Billing scope rules:
-
-- global binding may operate across Tenants;
-- Tenant binding may operate only on that Tenant;
-- global PriceRule operations require global scope;
-- unfiltered/cross-Tenant financial reads require global scope.
-
-## 10. BillingAccount API
+## 11. BillingAccount API
 
 ### Read BillingAccount
 
@@ -270,8 +301,6 @@ Body:
 
 `credit_limit_micros` is an integer string. Current implementation supports USD only.
 
-`PUT` is current full account configuration/upsert semantics, not a Ledger credit operation.
-
 ### Read exposure
 
 ```http
@@ -280,18 +309,7 @@ GET /api/gateway/admin/billing/accounts/{tenant_id}/exposure
 
 Permission: `billing.accounts.read`.
 
-Response includes:
-
-```json
-{
-  "account": {},
-  "ledger_balance_micros": "1000000",
-  "reserved_micros": "250000",
-  "available_micros": "10750000"
-}
-```
-
-## 11. PriceRule API
+## 12. PriceRule API
 
 ### List rules
 
@@ -301,9 +319,7 @@ GET /api/gateway/admin/billing/price-rules?tenant_id=tenant_...
 
 Permission: `billing.pricing.read`.
 
-A Tenant-scoped caller must provide its matching `tenant_id` and receives only PriceRules explicitly owned by that Tenant. Raw global PriceRule rows are gateway-global configuration and require a global binding to read.
-
-A global caller may request a Tenant view and receive the applicable Tenant + global rules, or omit `tenant_id` for a global/unfiltered listing.
+A Tenant-scoped caller must provide its matching `tenant_id` and receives only PriceRules explicitly owned by that Tenant. Raw global PriceRule rows require global authorization.
 
 ### Create rule
 
@@ -314,42 +330,9 @@ Idempotency-Key: caller-generated-key
 
 Permission: `billing.pricing.write`.
 
-Example:
+New pricing is represented by new effective-dated rules rather than in-place historical mutation.
 
-```json
-{
-  "tenant_id": "tenant_optional",
-  "provider_type": "openai-agents",
-  "model": "gpt-example",
-  "metric": "model.input_tokens",
-  "unit_scale": "1000000",
-  "upstream_price_micros": "1250000",
-  "customer_price_micros": "1500000",
-  "currency": "USD",
-  "effective_from": "2026-09-14T00:00:00Z"
-}
-```
-
-At least one of upstream/customer price is required.
-
-Current metrics:
-
-```text
-model.input_tokens
-model.cached_input_tokens
-model.output_tokens
-sandbox.compute_seconds
-web_search.call
-file_search.call
-tool.call
-provider.other
-```
-
-v0.6 does not expose in-place PriceRule update/delete. New pricing is represented by new effective-dated rules.
-
-A rule without `tenant_id` is global and requires a global RoleBinding.
-
-## 12. Credit API
+## 13. Credit API
 
 ```http
 POST /api/gateway/admin/billing/credits
@@ -358,67 +341,73 @@ Idempotency-Key: caller-generated-key
 
 Permission: `billing.credits.write`.
 
-Body:
+The operation appends an immutable customer Ledger entry with kind `credit.grant`.
+
+## 14. Financial read APIs
+
+```text
+GET /api/gateway/admin/billing/usage
+GET /api/gateway/admin/billing/ledger
+GET /api/gateway/admin/billing/reservations
+```
+
+Tenant-scoped callers must query their Tenant. Omitting `tenant_id` is a global/unfiltered read and requires a global binding. These reads are audited.
+
+## 15. Commercial Plan APIs
+
+### List/create Plans
+
+```text
+GET  /api/gateway/admin/commercial/plans
+POST /api/gateway/admin/commercial/plans
+```
+
+Plan resources are global. Create requires `Idempotency-Key` and `commercial.plans.write` with global scope.
+
+### List/create PlanVersions
+
+```text
+GET  /api/gateway/admin/commercial/plans/{plan_id}/versions
+POST /api/gateway/admin/commercial/plans/{plan_id}/versions
+```
+
+PlanVersion is immutable after creation. Example create body:
 
 ```json
 {
-  "tenant_id": "tenant_...",
-  "amount_micros": "5000000",
-  "reason": "manual prepaid credit"
+  "billing_interval": "month",
+  "recurring_price_micros": "20000000",
+  "included_credit_micros": "5000000",
+  "default_session_budget_micros": "2000000",
+  "requests_per_minute": 600,
+  "max_concurrency": 40,
+  "entitlements": { "sandbox": true },
+  "effective_from": "2026-09-15T00:00:00Z"
 }
 ```
 
-The operation appends an immutable customer Ledger entry with kind `credit.grant`.
+Commercial money fields are exact integer USD micros. A new commercial offer creates a new PlanVersion instead of changing an existing one.
 
-It does not mutate historical Ledger rows.
-
-## 13. Financial read APIs
-
-Usage:
-
-```http
-GET /api/gateway/admin/billing/usage?tenant_id=...&session_id=...&limit=100
-```
-
-Permission: `billing.usage.read`.
-
-Ledger:
-
-```http
-GET /api/gateway/admin/billing/ledger?tenant_id=...&session_id=...&book=customer&limit=100
-```
-
-Permission: `billing.ledger.read`.
-
-Reservations:
-
-```http
-GET /api/gateway/admin/billing/reservations?tenant_id=...&session_id=...&limit=100
-```
-
-Permission: `billing.reservations.read`.
-
-Tenant-scoped callers must query their Tenant. Omitting `tenant_id` is a global/unfiltered read and requires a global binding.
-
-All these reads are audited.
-
-## 14. Billing mutation idempotency and atomicity
-
-Every Billing Control Plane mutation requires:
-
-```http
-Idempotency-Key: caller-generated-key
-```
-
-Missing/invalid management idempotency headers are authenticated mutation failures and therefore produce `outcome=error` AuditEvents.
-
-Management idempotency scope:
+## 16. Subscription and CommercialPolicy APIs
 
 ```text
-ControlPrincipal/bootstrap actor + billing action + Idempotency-Key
+GET  /api/gateway/admin/commercial/subscriptions?tenant_id=tenant_...
+POST /api/gateway/admin/commercial/subscriptions
+POST /api/gateway/admin/commercial/subscriptions/{subscription_id}/cancel
+GET  /api/gateway/admin/commercial/policy?tenant_id=tenant_...
 ```
 
-The semantic request is fingerprinted. Completed response replay is encrypted at rest with the gateway Credential keyring.
+Subscription and policy operations carry Tenant scope. Unfiltered subscription listing requires global authorization.
+
+Subscription create body identifies an exact `plan_version_id` plus optional start/end timestamps. A Tenant cannot have overlapping scheduled/active subscription intervals.
+
+Policy response is the resolved runtime view for the active subscription and includes Plan/PlanVersion/Subscription identity, current period, default Session budget, RPM, concurrency, included-credit entitlement and non-secret entitlements.
+
+Every Commercial mutation requires `Idempotency-Key`. Mutation + success AuditEvent + encrypted replay completion commit atomically in the existing Control Plane transaction.
+
+## 17. Billing mutation idempotency and atomicity
+
+Every Billing Control Plane mutation requires `Idempotency-Key`. Missing/invalid management idempotency headers are authenticated mutation failures and produce `outcome=error` AuditEvents.
 
 A successful financial mutation is one durable transaction:
 
@@ -429,25 +418,9 @@ financial mutation
 = one Postgres commit
 ```
 
-On failure, that durable unit rolls back and a separate `outcome=error` AuditEvent is appended after rollback.
+Credit grant adds a permanent immutable-Ledger identity including the semantic request fingerprint so a reclaimed management key cannot resolve to a different historical credit.
 
-A completed replay does not re-run the financial mutation; it returns the original response with:
-
-```http
-X-Agent-Gateway-Idempotent-Replay: true
-```
-
-and records current-request audit evidence.
-
-Credit grant adds a permanent immutable-Ledger identity scoped by:
-
-```text
-actor + credit action + Tenant + management key + semantic request fingerprint
-```
-
-The semantic fingerprint prevents a reclaimed/expired management key with a changed amount/reason from resolving to an older Ledger credit.
-
-## 15. Tenant / Project / Virtual Key Control Plane
+## 18. Tenant / Project / Virtual Key Control Plane
 
 ```text
 POST /api/gateway/admin/tenants
@@ -455,70 +428,29 @@ POST /api/gateway/admin/projects
 POST /api/gateway/admin/virtual-keys
 ```
 
-Permissions:
-
-- Tenant create: `tenants.write` global.
-- Project create: `projects.write` global or matching Tenant scope.
-- Virtual Key create: `keys.write` global or matching Tenant scope.
-
 Virtual Key plaintext is returned exactly once; durable storage keeps hash + display prefix.
 
-## 16. Provider / Credential / Channel Control Plane
-
-Providers:
+## 19. Provider / Credential / Channel Control Plane
 
 ```text
-GET   /api/gateway/admin/providers
-POST  /api/gateway/admin/providers
-PATCH /api/gateway/admin/providers/{provider_id}
-```
-
-Credentials:
-
-```text
-GET   /api/gateway/admin/credentials
-POST  /api/gateway/admin/credentials
-PATCH /api/gateway/admin/credentials/{credential_id}
-POST  /api/gateway/admin/credentials/{credential_id}/rewrap
-```
-
-Channels:
-
-```text
-GET   /api/gateway/admin/channels
-POST  /api/gateway/admin/channels
-PATCH /api/gateway/admin/channels/{channel_id}
+GET/POST/PATCH /api/gateway/admin/providers...
+GET/POST/PATCH /api/gateway/admin/credentials...
+GET/POST/PATCH /api/gateway/admin/channels...
 ```
 
 Credential payloads are encrypted and never returned. Channel may reference only a Credential owned by the same Provider. Runtime registry rebuild happens after durable Control Plane commit.
 
-## 17. Principals / Role Bindings / Audit
-
-Principals:
+## 20. Principals / Role Bindings / Audit
 
 ```text
-GET   /api/gateway/admin/principals
-POST  /api/gateway/admin/principals
-PATCH /api/gateway/admin/principals/{principal_id}
-```
-
-Role Bindings:
-
-```text
-GET    /api/gateway/admin/role-bindings
-POST   /api/gateway/admin/role-bindings
-DELETE /api/gateway/admin/role-bindings/{binding_id}
-```
-
-Audit:
-
-```http
+GET/POST/PATCH /api/gateway/admin/principals...
+GET/POST/DELETE /api/gateway/admin/role-bindings...
 GET /api/gateway/admin/audit
 ```
 
 Audit supports actor/resource/Tenant/outcome filters and is append-only.
 
-## 18. Error model
+## 21. Error model
 
 Gateway errors use:
 
@@ -538,11 +470,11 @@ Expected HTTP classes:
 - `402`: billed Tenant cannot financially admit new Agent work.
 - `403`: authenticated Control Principal lacks permission/scope.
 - `404`: scoped resource not found.
-- `409`: idempotency, duplicate, FK/ownership or state conflict.
+- `409`: idempotency, duplicate, subscription overlap, FK/ownership or state conflict.
 - `429`: rate/concurrency/session-budget admission failure.
 - `502/503`: Provider/Channel/infrastructure or required pricing unavailable.
 
-## 19. Data Plane idempotency
+## 22. Data Plane idempotency
 
 Session creation HTTP idempotency scope:
 
@@ -550,13 +482,11 @@ Session creation HTTP idempotency scope:
 Tenant + VirtualKey + operation + Idempotency-Key
 ```
 
-The fingerprint includes the body, routing/capability hints and normalized exact Session budget micros.
+The fingerprint includes the body, routing/capability hints and the **effective** normalized exact Session budget after CommercialPolicy defaulting.
 
 A pending claim is released only for failures known to occur before Provider invocation. Potentially side-effecting failures remain pending to prevent duplicate Agent Sessions and duplicate spend.
 
-Session event body `idempotency_key` remains provider-compatible.
-
-## 20. Identifier prefixes
+## 23. Identifier prefixes
 
 ```text
 tenant_     Tenant
@@ -571,6 +501,9 @@ agres_      Reservation
 agprice_    PriceRule
 agusg_      UsageEvent
 agled_      LedgerEntry
+agplan_     Plan
+agplanv_    PlanVersion
+agsub_      Subscription
 agcp_       Control Principal / token family
 agrb_       Role Binding
 agaud_      Audit Event

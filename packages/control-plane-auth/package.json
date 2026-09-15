@@ -13,6 +13,10 @@
     "./billing": {
       "types": "./dist/billing.d.ts",
       "default": "./dist/billing.js"
+    },
+    "./commercial": {
+      "types": "./dist/commercial.d.ts",
+      "default": "./dist/commercial.js"
     }
   },
   "scripts": { "build": "tsc -b" },

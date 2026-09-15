@@ -1,13 +1,13 @@
 {
   "name": "agent-gateway",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
   "description": "Open-source Agent API gateway for routing, tenancy, session affinity, metering and billing across agent runtimes.",
   "workspaces": ["apps/*", "packages/*"],
   "scripts": {
     "build": "tsc -b",
     "check": "tsc -b --pretty false",
-    "test": "npm run build && node --test --test-concurrency=1 packages/core/dist/index.test.js packages/credential-crypto/dist/index.test.js packages/control-plane-auth/dist/index.test.js packages/storage-postgres/dist/index.test.js packages/runtime-redis/dist/index.test.js packages/billing-postgres/dist/index.test.js packages/billing-runtime/dist/index.test.js apps/server/dist/billing-control-plane.test.js",
+    "test": "npm run build && node --test --test-concurrency=1 packages/core/dist/index.test.js packages/credential-crypto/dist/index.test.js packages/control-plane-auth/dist/index.test.js packages/storage-postgres/dist/index.test.js packages/runtime-redis/dist/index.test.js packages/billing-postgres/dist/index.test.js packages/billing-runtime/dist/index.test.js packages/commercial-postgres/dist/index.test.js apps/server/dist/billing-control-plane.test.js apps/server/dist/commercial-control-plane.test.js apps/server/dist/commercial-runtime.test.js",
     "dev": "npm run build && node apps/server/dist/index.js",
     "start": "node apps/server/dist/index.js"
   },

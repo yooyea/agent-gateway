@@ -23,7 +23,12 @@ export type ControlPlanePermission =
   | "billing.credits.write"
   | "billing.usage.read"
   | "billing.ledger.read"
-  | "billing.reservations.read";
+  | "billing.reservations.read"
+  | "commercial.plans.read"
+  | "commercial.plans.write"
+  | "commercial.subscriptions.read"
+  | "commercial.subscriptions.write"
+  | "commercial.policy.read";
 
 export type ControlPlaneRole = "owner" | "admin" | "operator" | "viewer";
 export type RoleScopeType = "global" | "tenant";
@@ -50,6 +55,11 @@ const ALL_PERMISSIONS: ControlPlanePermission[] = [
   "billing.usage.read",
   "billing.ledger.read",
   "billing.reservations.read",
+  "commercial.plans.read",
+  "commercial.plans.write",
+  "commercial.subscriptions.read",
+  "commercial.subscriptions.write",
+  "commercial.policy.read",
 ];
 
 const BILLING_READ_PERMISSIONS: ControlPlanePermission[] = [
@@ -58,6 +68,12 @@ const BILLING_READ_PERMISSIONS: ControlPlanePermission[] = [
   "billing.usage.read",
   "billing.ledger.read",
   "billing.reservations.read",
+];
+
+const COMMERCIAL_READ_PERMISSIONS: ControlPlanePermission[] = [
+  "commercial.plans.read",
+  "commercial.subscriptions.read",
+  "commercial.policy.read",
 ];
 
 const ROLE_PERMISSIONS: Record<ControlPlaneRole, ReadonlySet<ControlPlanePermission>> = {
@@ -75,6 +91,7 @@ const ROLE_PERMISSIONS: Record<ControlPlaneRole, ReadonlySet<ControlPlanePermiss
     "channels.read",
     "channels.write",
     ...BILLING_READ_PERMISSIONS,
+    ...COMMERCIAL_READ_PERMISSIONS,
   ]),
   viewer: new Set([
     "providers.read",
@@ -83,6 +100,7 @@ const ROLE_PERMISSIONS: Record<ControlPlaneRole, ReadonlySet<ControlPlanePermiss
     "rbac.read",
     "audit.read",
     ...BILLING_READ_PERMISSIONS,
+    ...COMMERCIAL_READ_PERMISSIONS,
   ]),
 };
 

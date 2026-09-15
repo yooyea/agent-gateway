@@ -1,240 +1,199 @@
 # Domain Ontology
 
-This document defines what entities exist, how they relate and which statements must always remain true.
+This document defines the durable entities, relations, and statements that must remain true.
 
-## 1. Identity domain
+## 1. Identity and governance
 
 ### Tenant
 
-A commercial/security boundary that owns Projects, Virtual Keys, policies and billing state.
-
-### User
-
-A human identity that may belong to one or more Tenants through Memberships.
-
-### Membership
-
-Relates a User to a Tenant with one or more roles.
+The commercial and security boundary. A Tenant owns Projects, Virtual Keys, Sessions, billing state, and Subscriptions.
 
 ### Project
 
-A namespace inside a Tenant. Sessions and Virtual Keys may be scoped to a Project.
+A namespace inside a Tenant. Sessions and Virtual Keys may be Project-scoped.
 
 ### VirtualKey
 
-A caller credential issued by the gateway. A VirtualKey resolves to exactly one Tenant and may resolve to one Project.
-
-A Project-scoped VirtualKey can access only Sessions in the same Project. A Tenant-level VirtualKey may access Sessions across Projects inside that Tenant.
+A Data Plane caller credential. It resolves to exactly one Tenant and optionally one Project. Project-scoped keys cannot access Sessions in another Project.
 
 ### ControlPrincipal
 
-A durable Control Plane operator or service identity.
-
-A ControlPrincipal authenticates with a one-time `agcp_*` bearer secret. The plaintext secret is returned only at creation time; the durable record stores only a SHA-256 hash and display prefix.
-
-The environment bootstrap administrator is represented at runtime as a synthetic ControlPrincipal-like actor but is not persisted as a normal database Principal.
+A durable Control Plane operator/service identity authenticated by a one-time `agcp_*` bearer secret. Only its hash and display prefix are durable.
 
 ### RoleBinding
 
-Relates a ControlPrincipal to a built-in Role within an explicit scope.
-
-A RoleBinding has:
-
-- one ControlPrincipal
-- one Role (`owner`, `admin`, `operator`, `viewer`)
-- one scope type (`global` or `tenant`)
-- an optional Tenant scope id when the scope type is `tenant`
-
-Role names are policy bundles; authorization decisions are expressed in Permissions.
+Relates a ControlPrincipal to a built-in Role (`owner`, `admin`, `operator`, `viewer`) in `global` or `tenant` scope.
 
 ### Permission
 
-A stable Control Plane capability such as `channels.write`, `credentials.rewrap`, `rbac.manage`, or `audit.read`.
+A stable authorization capability. Global resources require global authorization. Tenant-scoped bindings satisfy only operations carrying the matching Tenant scope.
 
-Global resources require global permission. Tenant-scoped bindings may satisfy a permission only when the operation carries the matching Tenant scope.
+### AuditEvent
 
-## 2. Runtime supply domain
+Append-only governance evidence for Control Plane actions. It records actor, request id, action, resource, optional Tenant, outcome, non-secret metadata, and creation time.
+
+## 2. Runtime supply
 
 ### Provider
 
-A type of upstream agent runtime implementation.
-
-Examples: `openai-agents`, future `claude-agent`, future self-hosted harness adapters.
-
-Provider is semantic/technical adapter identity. It is not a routable account and does not contain provider secrets.
+A runtime adapter type such as `openai-agents`.
 
 ### Credential
 
-Encrypted secret material used to authenticate or authorize calls to one Provider.
-
-A Credential belongs to exactly one Provider. It may contain API keys, tokens or other provider-native authentication fields. Its plaintext payload exists only inside the narrow provider execution boundary.
-
-Credential encryption metadata is durable; master decryption keys are external runtime secrets and are not ontology-owned database records.
+Encrypted secret material owned by one Provider. Master encryption keys remain outside Postgres.
 
 ### Channel
 
-A routable Provider instance/configuration.
-
-A Channel belongs to exactly one Provider and may reference one Credential belonging to that same Provider. It carries non-secret endpoint/configuration metadata, priority/weight and enabled state.
-
-A Provider may have zero or many Channels. A Credential may be reused by multiple Channels of the same Provider.
+One routable Provider instance/configuration. A Channel belongs to one Provider and may reference only a Credential owned by that Provider.
 
 ### Capability
 
-A runtime feature such as sandbox, streaming, MCP, tools, artifacts or subagents.
+A runtime feature such as sandbox, streaming, MCP, tools, artifacts, or subagents.
 
-A Channel inherits Provider capabilities and may further constrain them.
-
-## 3. Runtime demand domain
+## 3. Runtime demand
 
 ### Session
 
-Gateway-owned durable conversation/execution identity.
-
-A Session belongs to exactly one Tenant and may belong to one Project. Its external identity is gateway-owned (`agsess_*`).
+Gateway-owned durable Agent conversation/execution identity. Public IDs use `agsess_*`. A Session belongs to exactly one Tenant and optionally one Project.
 
 ### SessionBinding
 
-The routing relationship established when a Session is created:
+The immutable normal routing relationship:
 
 ```text
 Session -> Provider -> Channel -> ProviderSessionId
 ```
 
-The selected Channel is durably recorded while the binding is still `creating`, before the Provider Session is created.
-
-Normal session traffic never replaces this binding.
-
-A Channel becoming disabled, unhealthy or open-circuit does not rewrite an existing SessionBinding.
+The selected Channel is persisted while the Session is still `creating`, before upstream Session creation. Normal traffic never silently replaces this binding.
 
 ### Execution
 
-A bounded period of work inside a Session. A Session may contain many Executions/turns.
-
-Execution is the natural unit for latency, iteration and tool-level traces even when a provider only exposes aggregate Session usage.
+A bounded period of Agent work inside a Session.
 
 ### Event
 
-An input or output occurrence associated with a Session/Execution: message, tool call/result, approval, artifact, environment event, cancellation or provider-native event.
+A message/tool/approval/artifact/cancellation/provider-native occurrence associated with Session/Execution.
 
 ### Environment
 
-The execution environment used by an agent: none, provider-hosted sandbox or external runtime.
+Agent execution environment: none, provider-hosted sandbox, or external runtime.
 
 ### Artifact
 
-A durable output produced by an Execution such as a file, patch, report or build artifact.
+A durable output produced by Agent execution.
 
-## 4. Policy domain
+## 4. Runtime policy
 
 ### RoutingPolicy
 
 Determines which Channels are eligible for a new Session.
 
-### Quota
-
-A cumulative allowance over a period: requests, tokens, sessions, compute, cost, etc.
-
 ### RateLimit
 
-A throughput constraint over a short time window.
+A short-window throughput constraint.
 
 ### ConcurrencyLimit
 
-A maximum number of simultaneously active Sessions/Executions.
+A maximum simultaneous workload constraint.
+
+### Quota
+
+A cumulative period allowance such as requests, tokens, compute, sessions, or spend.
 
 ### SessionBudget
 
-A hard or soft upper bound attached to a Session, for example max cost, duration, iterations or subagents.
+A hard/soft Session-level boundary. `max_cost_micros` is the first hard financial dimension. The effective Session budget is persisted at creation and is not retroactively changed by later commercial policy changes.
 
-`max_cost_usd` is the first hard-enforced financial SessionBudget dimension.
+## 5. Commercial contract domain
 
-## 5. Metering and finance domain
+### Plan
+
+A mutable commercial product identity (`agplan_*`) with name/description/status.
+
+### PlanVersion
+
+An immutable commercial terms snapshot (`agplanv_*`) belonging to one Plan.
+
+It may define:
+
+- billing interval
+- recurring price in exact micros
+- included-credit entitlement in exact micros
+- default Session budget
+- requests per minute
+- max concurrency
+- non-secret entitlements
+- effective timestamp
+
+Changing an offer creates a new PlanVersion; existing versions are never updated/deleted.
+
+### Subscription
+
+A Tenant contract (`agsub_*`) pinned to exactly one PlanVersion and one time interval.
+
+Commercial identity is:
+
+```text
+Tenant + PlanVersion + starts_at
+```
+
+A Tenant cannot have overlapping scheduled/active subscription intervals.
+
+### CommercialPolicy
+
+A runtime projection of the currently active Subscription and pinned PlanVersion. It exposes current period, Plan identity, default Session budget, RPM, concurrency, included-credit entitlement, and entitlements.
+
+CommercialPolicy is not financial truth and does not mutate historical Sessions, UsageEvents, or LedgerEntries.
+
+### IncludedCredit entitlement
+
+`included_credit_micros` on PlanVersion is currently an entitlement declaration only. It is not spendable balance until a future period-scoped CreditBucket/Ledger grant materializes it.
+
+## 6. Metering and finance
 
 ### BillingAccount
 
-The Tenant-level financial account that activates billed execution and defines currency, enabled state and credit capacity.
-
-A Tenant without a BillingAccount is currently treated as unbilled. A Tenant with an enabled BillingAccount must pass financial admission before new provider work is authorized.
+Tenant-level financial account activating billed execution and defining currency, enabled state, and credit capacity.
 
 ### UsageEvent
 
-An append-only measured fact: model tokens, sandbox duration, tool invocation, storage, search call or provider-specific unit.
-
-UsageEvent stores a **delta**, even when the upstream Provider reports cumulative usage.
-
-UsageEvent may be provisional, final or an adjustment. Provider corrections append negative adjustment UsageEvents rather than rewriting older facts.
+Append-only measured delta evidence for model tokens, sandbox duration, search/tool units, or provider-specific usage. Provider corrections append negative adjustments.
 
 ### UsageCounter
 
-The durable cumulative watermark for one Session + usage metric.
-
-It serializes concurrent observations, remembers the latest provider-measured time, and prevents stale cumulative snapshots from moving financial state backward.
+Durable Session + metric cumulative watermark. It serializes observations and rejects stale provider snapshots.
 
 ### UsageSettlement
 
-Mutable processing state associated with one immutable UsageEvent.
-
-It records whether the event has no applicable price yet or has been settled using a specific PriceRule. Separating this state allows later pricing/reconciliation without modifying UsageEvent evidence.
+Mutable processing state for immutable UsageEvent evidence: `no_price` or `settled` with PriceRule.
 
 ### PriceRule
 
-Maps a UsageEvent metric to upstream cost and/or customer price for a particular effective time range and optional Tenant/Provider/model dimensions.
+Effective-dated mapping from usage dimensions to upstream cost and/or customer price.
 
 ### Cost
 
-What the gateway owes an upstream provider for measured usage.
+What the gateway owes an upstream provider.
 
 ### Charge
 
-What a customer owes the gateway. Cost and Charge are not required to be equal.
+What a customer owes the gateway.
 
 ### Reservation
 
-Locks customer spend capacity before uncertain long-running execution occurs.
-
-A billed Session has at most one attached active Reservation in the current implementation. Reservation amount represents the maximum authorized spend for that Session; `consumed_micros` tracks the customer charge already represented in the Ledger.
-
-Only the unconsumed part remains an outstanding hold.
+Locks customer spend capacity before uncertain long-running Agent execution. Only the unconsumed amount remains outstanding exposure.
 
 ### Settlement
 
-The process that converts a UsageEvent under an effective PriceRule into upstream/customer LedgerEntries and consumes the Session Reservation.
+Converts UsageEvent evidence under a PriceRule into LedgerEntries and consumes Reservation capacity.
 
 ### LedgerEntry
 
-Immutable financial record. Historical LedgerEntries are never recomputed when a PriceRule changes.
-
-Every usage-derived LedgerEntry carries the price snapshot used to create it.
+Immutable financial truth. Usage-derived entries snapshot the PriceRule used; historical entries are never recomputed.
 
 ### Reconciliation
 
-Compares later provider cumulative truth with the durable UsageCounter and emits adjustment UsageEvents/LedgerEntries rather than mutating history.
-
-## 6. Observability and governance domain
-
-### Trace
-
-Correlates requests, executions, provider calls, tools and usage.
-
-### AuditEvent
-
-An append-only security/administrative fact describing a Control Plane action.
-
-An AuditEvent records:
-
-- actor identity
-- request id
-- action
-- resource type and optional resource id
-- optional Tenant scope
-- outcome (`success`, `denied`, `error`)
-- non-secret metadata
-- creation time
-
-AuditEvent is not a general application log. It is durable governance evidence and may not contain bearer tokens, Virtual Key secrets, Credential payloads, ciphertext, master encryption keys, or decrypted provider secrets.
-
-Authenticated permission denials are AuditEvents even though no resource mutation occurred.
+Compares later provider truth against UsageCounter and appends adjustment UsageEvents/LedgerEntries rather than rewriting history.
 
 ## 7. Critical relations
 
@@ -243,22 +202,27 @@ Tenant 1 --- N Project
 Tenant 1 --- N VirtualKey
 Tenant 1 --- N Session
 Tenant 1 --- 0..1 BillingAccount
+Tenant 1 --- N Subscription
 Project 1 --- N Session
 
 ControlPrincipal 1 --- N RoleBinding
-RoleBinding N --- 1 Role
-RoleBinding N --- 1 Scope
 ControlPrincipal 1 --- N AuditEvent
 
 Provider 1 --- N Channel
 Provider 1 --- N Credential
 Channel N --- 0..1 Credential (same Provider only)
 
+Plan 1 --- N PlanVersion
+PlanVersion 1 --- N Subscription
+Subscription N --- 1 Tenant
+Subscription N --- 1 PlanVersion
+CommercialPolicy 1 --- 1 active Subscription projection
+
 Session 1 --- 1 SessionBinding
 Session 1 --- N Execution
 Session 1 --- N UsageEvent
 Session 1 --- N UsageCounter
-Session 1 --- 0..1 attached Reservation
+Session 1 --- 0..1 attached active Reservation
 Execution 1 --- N Event
 Execution 1 --- N Artifact
 UsageEvent 1 --- 1 UsageSettlement
@@ -270,31 +234,34 @@ Reservation 1 --- 0..N customer LedgerEntry
 ## 8. Invariants
 
 1. Every authenticated Data Plane request has one Tenant context.
-2. A Session cannot be read or mutated from another Tenant context.
-3. A Project-scoped VirtualKey cannot access a Session from another Project, even inside the same Tenant.
-4. Public Session ID never equals the provider-native session ID by architectural requirement.
-5. A SessionBinding selects one Channel for normal execution and is not silently replaced.
-6. A billed Session persists its `creating` SessionBinding and reserves customer capacity before upstream Session creation.
-7. Financial admission failure prevents the Provider Session call.
-8. A Channel belongs to exactly one Provider.
-9. A Credential belongs to exactly one Provider, and a Channel may reference only a Credential owned by that same Provider.
-10. Provider/Channel plaintext configuration contains no credential material; provider secrets are represented as Credential payloads.
-11. Credential master encryption keys are external runtime secrets, never database records or API resources.
-12. Routing is evaluated for new Sessions, not every event of an existing Session.
-13. Disabling/open-circuiting a Channel affects new routing but never silently moves a bound Session.
-14. UsageEvent is append-only evidence; UsageSettlement is separate mutable processing state; LedgerEntry is immutable financial truth.
-15. Reconciliation appends adjustment UsageEvents/LedgerEntries instead of rewriting historical usage or ledger entries.
-16. Price changes affect future settlement according to effective-time semantics; they do not rewrite historical price snapshots.
-17. A UsageCounter serializes concurrent cumulative observations for one Session + metric and does not accept a provider measurement older than its watermark.
-18. Outstanding Reservation exposure equals the unconsumed hold; spend already represented in the Ledger is not double-counted as a full Reservation.
-19. Before additional billed Agent work, current cumulative provider usage is reconciled and remaining SessionBudget is evaluated.
-20. A successful upstream mutation is not converted into a client-visible failure solely because best-effort post-operation accounting refresh failed; the next expensive operation reconciles strictly before admission.
-21. Cross-provider or cross-Channel session movement is represented as explicit migration/lineage, never hidden rerouting.
-22. A persisted ControlPrincipal secret is represented only by a hash/prefix; plaintext is returned once and is not recoverable from Postgres.
-23. Authorization decisions are permission-based and run before the governed resource mutation.
-24. Tenant-scoped RoleBindings cannot authorize global-only resources or RBAC management.
-25. RBAC management requires a global permission path; a tenant-scoped identity cannot elevate itself globally.
-26. Authenticated Control Plane authorization denials produce AuditEvents.
-27. AuditEvent is append-only and cannot be updated or deleted through the application or ordinary database row mutation.
-28. Secret material must never be copied into AuditEvent metadata.
-29. A Control Plane request id correlates the API operation with its AuditEvent.
+2. Cross-Tenant Session access is impossible; Project-scoped keys also cannot cross Project boundaries.
+3. Public Session ID is gateway-owned and distinct from provider-native identity by architecture.
+4. SessionBinding selects one Channel and is never silently replaced by health/routing changes.
+5. A billed Session persists `creating` binding and reserves capacity before upstream Session creation.
+6. Financial admission failure prevents upstream Provider work.
+7. Once Provider work may have started, ambiguous local failure does not automatically discard financial exposure or idempotency protection.
+8. Provider/Channel plaintext configuration contains no credential material.
+9. Channel may reference only a Credential owned by the same Provider.
+10. Credential master keys are external runtime secrets.
+11. Routing is evaluated for new Sessions, not every event of an existing Session.
+12. PlanVersion is immutable.
+13. Subscription Tenant, PlanVersion, and start time are immutable.
+14. A Tenant has no overlapping scheduled/active subscription intervals.
+15. Subscription always references one exact PlanVersion, never a moving latest version.
+16. Plan RPM/concurrency are runtime contract overrides; missing values fall back to environment defaults.
+17. Caller-explicit Session budget wins over Plan default budget.
+18. Existing Session budget does not change when Subscription/Plan changes later.
+19. Included-credit entitlement is not spendable until CreditBucket/Ledger materialization exists.
+20. UsageEvent and LedgerEntry are append-only; UsageSettlement is separate mutable processing state.
+21. Provider corrections append adjustments instead of rewriting usage/ledger history.
+22. Price changes affect future settlement only according to effective-time rules.
+23. UsageCounter serializes cumulative observations and never accepts an older provider watermark.
+24. Outstanding Reservation exposure equals the unconsumed hold; Ledger spend is not double-counted.
+25. Before additional billed Agent work, current provider usage is reconciled and remaining SessionBudget evaluated.
+26. Successful upstream mutation is not turned into a retryable client failure solely by best-effort post-operation accounting failure.
+27. Authorization runs before governed mutation; global resources require global authorization.
+28. RBAC management cannot be elevated through a Tenant-scoped role.
+29. Authenticated denials and governed mutation outcomes produce AuditEvents.
+30. AuditEvent is append-only and contains no secret material.
+31. Control Plane request id correlates API operation with audit evidence.
+32. Commercial contracts/policy never rewrite immutable financial history.
