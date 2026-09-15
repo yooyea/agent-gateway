@@ -71,6 +71,20 @@ test("commercial plans pin immutable versions and resolve tenant runtime policy"
   assert.equal((await commercial.resolvePolicy(tenantId))?.planVersionId, version2.id);
   assert.equal(second.planVersionId, version2.id);
 
+  await commercial.cancelSubscription(second.id);
+  const futureStart = new Date(Date.now() + 86_400_000);
+  const scheduled = await commercial.createSubscription({
+    tenantId,
+    planVersionId: version2.id,
+    startsAt: futureStart.toISOString(),
+  });
+  assert.equal(scheduled.status, "scheduled");
+  const canceledScheduled = await commercial.cancelSubscription(scheduled.id);
+  assert.equal(canceledScheduled.status, "canceled");
+  assert.equal(canceledScheduled.startsAt, futureStart.toISOString());
+  assert.equal(canceledScheduled.endsAt, undefined,
+    "canceling before start must not manufacture ends_at earlier than starts_at");
+
   await commercial.close();
   await gateway.close();
 });
