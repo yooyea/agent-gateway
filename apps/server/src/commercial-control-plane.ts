@@ -347,7 +347,7 @@ export function createCommercialControlPlaneHandler(deps: CommercialControlPlane
       if (path === "/api/gateway/admin/commercial/policy" && req.method === "GET") {
         const tenantId = optionalString(url.searchParams.get("tenant_id"));
         if (!tenantId) throw new Error("tenant_id is required");
-        const body = await read({ actor, requestId: rid, permission: "commercial.subscriptions.read",
+        const body = await read({ actor, requestId: rid, permission: "commercial.policy.read",
           action: "commercial.policy.read", resourceType: "commercial_policy", tenantId,
           run: () => commercial.resolvePolicy(tenantId) });
         json(res, 200, body ?? null, rid); return true;
