@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.7.0 - 2026-09-15
+
+### Plans and subscriptions
+
+- Added `@agent-gateway/commercial-postgres` with durable Plan, immutable PlanVersion, Subscription, and resolved CommercialPolicy resources.
+- PlanVersion snapshots recurring price, included-credit entitlement, default Session budget, RPM, concurrency and extensible entitlements using exact money micros.
+- PlanVersion UPDATE/DELETE is rejected at the database layer.
+- Subscription commercial identity (`Tenant + PlanVersion + starts_at`) is immutable and overlapping active/scheduled subscription periods are rejected.
+- Active subscriptions resolve one durable runtime CommercialPolicy without following a moving "latest Plan" pointer.
+
+### Commercial Control Plane
+
+- Added governed Plan / PlanVersion / Subscription / current-policy APIs under `/api/gateway/admin/commercial/*`.
+- Plan resources are global; Subscription and policy operations support Tenant scope.
+- Commercial mutations reuse Control Plane `Idempotency-Key`, encrypted replay, AuditEvent, and shared Postgres transaction guarantees.
+
+### Data Plane commercial policy
+
+- Active PlanVersion `requests_per_minute` and `max_concurrency` now override environment fallback admission values for that Tenant.
+- Active PlanVersion `default_session_budget_micros` supplies a hard Session budget when the caller omits `X-Agent-Gateway-Max-Cost-USD`.
+- A caller-explicit Session budget remains authoritative when present.
+- The effective budget participates in Session-create idempotency and is persisted with the Session, so later Plan/subscription changes do not rewrite an existing Session budget.
+
+### Included-credit boundary
+
+- `included_credit_micros` is persisted as a commercial entitlement snapshot only; it is not treated as a mutable wallet balance or spendable credit yet.
+- The next financial layer will materialize period-scoped CreditBuckets backed by immutable Ledger entries and explicit expiry/consumption allocation.
+
+### Validation
+
+- Added real Postgres tests for immutable PlanVersion terms, subscription overlap rejection, cancellation, and runtime policy resolution.
+- Added runtime helper tests for Plan quota overrides, environment fallbacks, and explicit-vs-default Session budget precedence.
+- Existing Postgres 17 + Redis 7, Data Plane billing, immutable Usage/Ledger, RBAC/Audit and Session Affinity suites remain release gates.
+
 ## 0.6.0 - 2026-09-14
 
 ### Billing Control Plane
@@ -143,7 +177,7 @@
 
 - Added `@agent-gateway/credential-crypto`.
 - Added AES-256-GCM authenticated encryption for upstream Credential payloads.
-- Bound ciphertext to Credential + Provider identity through authenticated data.
+- Bound ciphertext to Credential ID and Provider ID through authenticated data.
 - Master encryption keys stay outside Postgres and support multiple decrypt keys plus one active encryption key.
 - Added Credential master-key rewrap without changing the upstream provider secret.
 - Added upstream secret replacement through the Credential resource.
