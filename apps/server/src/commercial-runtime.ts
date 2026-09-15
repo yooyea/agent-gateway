@@ -27,6 +27,16 @@ export function resolveRuntimeAdmission(
   };
 }
 
+export function runtimeAdmissionKey(
+  tenantId: string,
+  callerFallbackKey: string,
+  admission: RuntimeAdmissionPolicy,
+) {
+  return admission.subscriptionId
+    ? `tenant:${tenantId}:subscription:${admission.subscriptionId}`
+    : callerFallbackKey;
+}
+
 export function applyCommercialSessionBudget(
   hints: RouteHints,
   policy: CommercialPolicy | undefined,
