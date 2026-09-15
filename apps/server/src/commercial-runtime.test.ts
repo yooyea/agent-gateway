@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { CommercialPolicy } from "@agent-gateway/commercial-postgres";
-import { applyCommercialSessionBudget, resolveRuntimeAdmission } from "./commercial-runtime.js";
+import {
+  applyCommercialSessionBudget,
+  resolveRuntimeAdmission,
+  runtimeAdmissionKey,
+} from "./commercial-runtime.js";
 
 const policy: CommercialPolicy = {
   tenantId: "tenant_1",
@@ -30,17 +34,32 @@ test("commercial policy overrides runtime admission defaults", () => {
   });
 });
 
-test("runtime admission falls back when tenant has no active subscription", () => {
-  assert.deepEqual(resolveRuntimeAdmission(undefined, {
+test("subscription admission limits are shared across tenant virtual keys", () => {
+  const admission = resolveRuntimeAdmission(policy, { requestsPerMinute: 120, maxConcurrency: 20 });
+  assert.equal(
+    runtimeAdmissionKey("tenant_1", "tenant_1:vk_a", admission),
+    "tenant:tenant_1:subscription:agsub_1",
+  );
+  assert.equal(
+    runtimeAdmissionKey("tenant_1", "tenant_1:vk_b", admission),
+    "tenant:tenant_1:subscription:agsub_1",
+    "Plan quota must not multiply when a Tenant creates another Virtual Key",
+  );
+});
+
+test("runtime admission falls back to caller scope when tenant has no active subscription", () => {
+  const admission = resolveRuntimeAdmission(undefined, {
     requestsPerMinute: 120,
     maxConcurrency: 20,
-  }), {
+  });
+  assert.deepEqual(admission, {
     requestsPerMinute: 120,
     maxConcurrency: 20,
     planId: undefined,
     planVersionId: undefined,
     subscriptionId: undefined,
   });
+  assert.equal(runtimeAdmissionKey("tenant_1", "tenant_1:vk_a", admission), "tenant_1:vk_a");
 });
 
 test("plan default session budget applies only when caller did not declare one", () => {
